@@ -11,13 +11,56 @@ from stable_baselines3.common.vec_env import DummyVecEnv
 from blackjack_env import BlackjackEnv
 
 
+ActionMasker = None
+
+
 def mask_fn(env):
-    return env.action_masks()
+    attempts = []
+
+    if hasattr(env, "action_masks"):
+        attempts.append("env.action_masks")
+        return env.action_masks()
+
+    get_wrapper_attr = getattr(env, "get_wrapper_attr", None)
+    if callable(get_wrapper_attr):
+        attempts.append("env.get_wrapper_attr('action_masks')")
+        try:
+            return get_wrapper_attr("action_masks")()
+        except Exception as exc:
+            attempts.append(f"get_wrapper_attr lookup failed: {exc!r}")
+
+    unwrapped = getattr(env, "unwrapped", None)
+    if unwrapped is not None and hasattr(unwrapped, "action_masks"):
+        attempts.append("env.unwrapped.action_masks")
+        return unwrapped.action_masks()
+
+    attempts.append("walk .env wrapper chain")
+    chain = [type(env).__name__]
+    current = getattr(env, "env", None)
+    visited = {id(env)}
+    while current is not None and id(current) not in visited:
+        chain.append(type(current).__name__)
+        if hasattr(current, "action_masks"):
+            return current.action_masks()
+        visited.add(id(current))
+        current = getattr(current, "env", None)
+
+    raise RuntimeError(
+        "Unable to resolve action_masks() from wrapped environment. "
+        f"Wrapper chain: {' -> '.join(chain)}. "
+        f"Lookup attempts: {', '.join(attempts)}. "
+        "Ensure ActionMasker wraps the base environment before Monitor "
+        "(expected order: Monitor(ActionMasker(base_env)))."
+    )
 
 
 def make_env(rank: int, base_seed: int):
     def _init():
         env = BlackjackEnv(seed=base_seed + rank)
+        # Keep Monitor statistics while ensuring mask_fn receives the base env.
+        # This wrapper order avoids ActionMasker passing a Monitor into mask_fn.
+        if ActionMasker is not None:
+            env = ActionMasker(env, mask_fn)
         return Monitor(env)
 
     return _init
@@ -33,6 +76,8 @@ def resolve_device(requested: str) -> str:
 
 
 def main() -> None:
+    global ActionMasker
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--total-timesteps", "--timesteps", dest="total_timesteps", type=int, default=2_000_000)
     parser.add_argument("--n-envs", type=int, default=8)
@@ -94,10 +139,7 @@ def main() -> None:
         use_maskable = False
 
     if use_maskable:
-        env_fns = [
-            (lambda rank=rank: ActionMasker(make_env(rank, args.seed)(), mask_fn))
-            for rank in range(args.n_envs)
-        ]
+        env_fns = [make_env(rank, args.seed) for rank in range(args.n_envs)]
         env = DummyVecEnv(env_fns)
         algo_cls = MaskablePPO
         print("Training algorithm: MaskablePPO (action masking enabled)")

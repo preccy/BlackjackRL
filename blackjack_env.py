@@ -70,12 +70,12 @@ class BlackjackEnv(gym.Env):
     @staticmethod
     def hand_value(cards: List[Card]) -> tuple[int, bool]:
         total = sum(c.value for c in cards)
-        aces = sum(1 for c in cards if c.rank == "A")
-        while total > 21 and aces > 0:
+        soft_aces = sum(1 for c in cards if c.rank == "A")
+        while total > 21 and soft_aces > 0:
             total -= 10
-            aces -= 1
-        usable_ace = any(c.rank == "A" for c in cards) and total + 10 <= 21
-        return total, usable_ace
+            soft_aces -= 1
+        return total, soft_aces > 0
+
 
     @staticmethod
     def is_blackjack(cards: List[Card]) -> bool:
@@ -321,3 +321,13 @@ class BlackjackEnv(gym.Env):
             "events": self.events[:],
             "info": self.last_info,
         }
+
+
+def _assert_hand_value_examples() -> None:
+    """Lightweight sanity checks for soft-hand handling."""
+    mk = lambda ranks: [Card(rank=r, suit="♠") for r in ranks]
+    assert BlackjackEnv.hand_value(mk(["A", "6"])) == (17, True)
+    assert BlackjackEnv.hand_value(mk(["A", "9"])) == (20, True)
+    assert BlackjackEnv.hand_value(mk(["A", "9", "5"])) == (15, False)
+    assert BlackjackEnv.hand_value(mk(["A", "A", "9"])) == (21, True)
+    assert BlackjackEnv.hand_value(mk(["A", "A", "9", "9"])) == (20, False)

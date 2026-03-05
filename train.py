@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import os
+import platform
+import time
 from pathlib import Path
 
 import torch
 from stable_baselines3 import PPO
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 
 from blackjack_env import BlackjackEnv
 
@@ -66,6 +69,66 @@ def make_env(rank: int, base_seed: int):
     return _init
 
 
+def parse_cpu_affinity(cpu_affinity: str | None) -> list[int] | None:
+    if not cpu_affinity:
+        return None
+    cpus = []
+    for token in cpu_affinity.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        cpus.append(int(token))
+    if not cpus:
+        return None
+    return cpus
+
+
+def apply_cpu_affinity(cpu_list: list[int] | None) -> str:
+    if not cpu_list:
+        return "not requested"
+    try:
+        if hasattr(os, "sched_setaffinity"):
+            os.sched_setaffinity(0, set(cpu_list))
+            return f"applied via os.sched_setaffinity: {cpu_list}"
+
+        import psutil  # type: ignore
+
+        proc = psutil.Process()
+        proc.cpu_affinity(cpu_list)
+        return f"applied via psutil: {cpu_list}"
+    except Exception as exc:
+        return f"failed to apply ({exc!r})"
+
+
+def configure_cpu_runtime(args, device: str) -> None:
+    if device != "cpu":
+        return
+
+    if args.torch_threads is not None:
+        os.environ.setdefault("OMP_NUM_THREADS", str(args.torch_threads))
+        os.environ.setdefault("MKL_NUM_THREADS", str(args.torch_threads))
+        os.environ.setdefault("OPENBLAS_NUM_THREADS", str(args.torch_threads))
+        torch.set_num_threads(args.torch_threads)
+
+    if args.torch_interop_threads is not None:
+        try:
+            torch.set_num_interop_threads(args.torch_interop_threads)
+        except RuntimeError as exc:
+            print(f"Warning: unable to set torch interop threads ({exc!r}).")
+
+
+def build_vec_env(n_envs: int, env_fns, vec_env: str):
+    vec_env_mode = vec_env
+    if vec_env_mode == "auto":
+        vec_env_mode = "dummy" if n_envs == 1 else "subproc"
+
+    if vec_env_mode == "dummy":
+        return DummyVecEnv(env_fns), "DummyVecEnv"
+
+    start_method = "spawn" if platform.system().lower().startswith("win") else "forkserver"
+    return SubprocVecEnv(env_fns, start_method=start_method), f"SubprocVecEnv(start_method={start_method})"
+
+
 def resolve_device(requested: str) -> str:
     if requested == "auto":
         return "auto"
@@ -84,6 +147,9 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0, help="Base random seed; each worker uses seed+rank.")
     parser.add_argument("--device", choices=["cpu", "cuda", "auto"], default="cpu")
     parser.add_argument("--torch-threads", type=int, default=None)
+    parser.add_argument("--torch-interop-threads", type=int, default=None)
+    parser.add_argument("--vec-env", choices=["auto", "dummy", "subproc"], default="auto")
+    parser.add_argument("--cpu-affinity", type=str, default=None, help="Optional CPU list, e.g. 0,1,2,3,4,5")
     parser.add_argument("--tensorboard-log", type=str, default="./tb_logs")
     parser.add_argument("--model-out", type=str, default="./models/blackjack_ppo")
     parser.add_argument("--model-in", type=str, default=None, help="Optional checkpoint to continue training from.")
@@ -97,15 +163,15 @@ def main() -> None:
         action="store_true",
         help="Allow fallback to vanilla PPO when --masking is set but MaskablePPO is unavailable.",
     )
+    progress_group = parser.add_mutually_exclusive_group()
+    progress_group.add_argument("--progress", dest="progress", action="store_true")
+    progress_group.add_argument("--no-progress", dest="progress", action="store_false")
+    parser.set_defaults(progress=True)
     args = parser.parse_args()
 
-    if args.torch_threads is not None:
-        torch.set_num_threads(args.torch_threads)
-        print(f"Set torch num threads: {args.torch_threads}")
-
     device = resolve_device(args.device)
-    print(f"Selected device: {device}")
-    print(f"Vector env setup: base_seed={args.seed}, n_envs={args.n_envs}")
+    configure_cpu_runtime(args, device)
+    affinity_status = apply_cpu_affinity(parse_cpu_affinity(args.cpu_affinity))
 
 
     maskable_available = False
@@ -140,14 +206,30 @@ def main() -> None:
 
     if use_maskable:
         env_fns = [make_env(rank, args.seed) for rank in range(args.n_envs)]
-        env = DummyVecEnv(env_fns)
+        env, actual_vec_env = build_vec_env(args.n_envs, env_fns, args.vec_env)
         algo_cls = MaskablePPO
-        print("Training algorithm: MaskablePPO (action masking enabled)")
+        masking_enabled = True
     else:
         env_fns = [make_env(rank, args.seed) for rank in range(args.n_envs)]
-        env = DummyVecEnv(env_fns)
+        env, actual_vec_env = build_vec_env(args.n_envs, env_fns, args.vec_env)
         algo_cls = PPO
-        print("Training algorithm: PPO (no action-mask support)")
+        masking_enabled = False
+
+    print("=== Training startup configuration ===")
+    print(f"Selected device: {device}")
+    print(f"Algorithm: {algo_cls.__name__}")
+    print(f"Masking enabled: {masking_enabled}")
+    print(f"Vector env setup: base_seed={args.seed}, n_envs={args.n_envs}, vec_env={actual_vec_env}")
+    print(f"torch num threads: {torch.get_num_threads()}")
+    print(f"torch interop threads: {torch.get_num_interop_threads()}")
+    print(
+        "CPU thread env vars: "
+        f"OMP_NUM_THREADS={os.environ.get('OMP_NUM_THREADS')}, "
+        f"MKL_NUM_THREADS={os.environ.get('MKL_NUM_THREADS')}, "
+        f"OPENBLAS_NUM_THREADS={os.environ.get('OPENBLAS_NUM_THREADS')}"
+    )
+    print(f"CPU affinity: {affinity_status}")
+    print(f"Progress bar: {'enabled' if args.progress else 'disabled'}")
 
     model_kwargs = dict(
         policy="MlpPolicy",
@@ -172,10 +254,25 @@ def main() -> None:
     else:
         model = algo_cls(**model_kwargs)
 
-    model.learn(total_timesteps=args.total_timesteps)
+    start = time.perf_counter()
+    try:
+        model.learn(total_timesteps=args.total_timesteps, progress_bar=args.progress)
+    except ImportError as exc:
+        if args.progress:
+            print(
+                "Warning: progress bar dependencies missing (install `tqdm` and `rich`). "
+                f"Continuing without progress bar. Details: {exc!r}"
+            )
+            model.learn(total_timesteps=args.total_timesteps, progress_bar=False)
+        else:
+            raise
+    elapsed = max(1e-9, time.perf_counter() - start)
     Path(args.model_out).parent.mkdir(parents=True, exist_ok=True)
     model.save(args.model_out)
     print(f"Saved model to {args.model_out}.zip")
+    print(f"Total timesteps seen: {model.num_timesteps}")
+    print(f"Elapsed wall time: {elapsed:.2f}s")
+    print(f"Approx throughput: {model.num_timesteps / elapsed:.2f} timesteps/s")
 
 
 if __name__ == "__main__":

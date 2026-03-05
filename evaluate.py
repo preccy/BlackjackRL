@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import time
 from pathlib import Path
 
 import numpy as np
@@ -52,6 +53,11 @@ def main() -> None:
     parser.add_argument("--save-replays", type=int, default=50)
     parser.add_argument("--replay-out", type=str, default="./replays/eval_bundle.json")
     parser.add_argument("--algo", choices=["auto", "maskable", "ppo"], default="auto")
+    progress_group = parser.add_mutually_exclusive_group()
+    progress_group.add_argument("--progress", dest="progress", action="store_true")
+    progress_group.add_argument("--no-progress", dest="progress", action="store_false")
+    parser.add_argument("--progress-update-every", type=int, default=250)
+    parser.set_defaults(progress=True)
     args = parser.parse_args()
 
     model = None
@@ -75,6 +81,16 @@ def main() -> None:
     mask_aware_predict = using_maskable or args.algo == "maskable"
     print(f"Evaluation using mask-aware predict: {mask_aware_predict}")
 
+    progress = None
+    if args.progress:
+        try:
+            from tqdm.auto import tqdm
+
+            progress = tqdm(total=args.hands, unit="hand", dynamic_ncols=True, desc="Evaluating")
+        except Exception as exc:
+            print(f"Warning: could not initialize tqdm progress bar ({exc!r}); continuing without it.")
+
+    start = time.perf_counter()
     episode_rewards = []
     episode_count = 0
     resolved_hands = 0
@@ -120,6 +136,22 @@ def main() -> None:
 
         if len(interesting) < args.save_replays and pick_interesting(final_info):
             interesting.append(env.export_episode())
+
+        if progress is not None:
+            progress.update(1)
+            if (ep + 1) % max(1, args.progress_update_every) == 0 or (ep + 1) == args.hands:
+                elapsed = max(1e-9, time.perf_counter() - start)
+                denom_hands = max(1, resolved_hands)
+                progress.set_postfix(
+                    resolved=resolved_hands,
+                    ev=f"{np.mean(episode_rewards):.4f}",
+                    win_rate=f"{wins / denom_hands:.3f}",
+                    net=f"{np.sum(episode_rewards):.1f}",
+                    hps=f"{episode_count / elapsed:.1f}",
+                )
+
+    if progress is not None:
+        progress.close()
 
     denom_hands = max(1, resolved_hands)
     print(f"Episodes played: {episode_count}")

@@ -12,6 +12,7 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 
 from blackjack_env import BlackjackEnv
+from callbacks.eval_callback import TrainingEvalCallback
 
 
 ActionMasker = None
@@ -153,6 +154,8 @@ def main() -> None:
     parser.add_argument("--tensorboard-log", type=str, default="./tb_logs")
     parser.add_argument("--model-out", type=str, default="./models/blackjack_ppo")
     parser.add_argument("--model-in", type=str, default=None, help="Optional checkpoint to continue training from.")
+    parser.add_argument("--train-eval-freq", type=int, default=100_000)
+    parser.add_argument("--train-eval-hands", type=int, default=20_000)
     parser.add_argument(
         "--masking",
         action="store_true",
@@ -254,16 +257,27 @@ def main() -> None:
     else:
         model = algo_cls(**model_kwargs)
 
+    eval_env_seed_base = args.seed + 100_000
+
+    def make_eval_env():
+        return BlackjackEnv(seed=eval_env_seed_base, record_events=False)
+
+    callback = TrainingEvalCallback(
+        eval_env_fn=make_eval_env,
+        eval_freq=args.train_eval_freq,
+        n_eval_hands=args.train_eval_hands,
+    )
+
     start = time.perf_counter()
     try:
-        model.learn(total_timesteps=args.total_timesteps, progress_bar=args.progress)
+        model.learn(total_timesteps=args.total_timesteps, callback=callback, progress_bar=args.progress)
     except ImportError as exc:
         if args.progress:
             print(
                 "Warning: progress bar dependencies missing (install `tqdm` and `rich`). "
                 f"Continuing without progress bar. Details: {exc!r}"
             )
-            model.learn(total_timesteps=args.total_timesteps, progress_bar=False)
+            model.learn(total_timesteps=args.total_timesteps, callback=callback, progress_bar=False)
         else:
             raise
     elapsed = max(1e-9, time.perf_counter() - start)

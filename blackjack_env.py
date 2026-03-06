@@ -38,6 +38,7 @@ class BlackjackEnv(gym.Env):
         illegal_action_penalty: float = -0.05,
         seed: Optional[int] = None,
         record_events: bool = False,
+        obs_version: int = 1,
     ):
         super().__init__()
         self.n_decks = n_decks
@@ -48,12 +49,16 @@ class BlackjackEnv(gym.Env):
         self.max_hands = max_hands
         self.illegal_action_penalty = illegal_action_penalty
         self.record_events = record_events
+        if obs_version not in {1, 2}:
+            raise ValueError(f"Unsupported obs_version={obs_version}; expected 1 or 2.")
+        self.obs_version = obs_version
 
         self.rng = random.Random(seed)
         self.shoe = Shoe(n_decks=n_decks, penetration=penetration, rng=self.rng)
 
         self.action_space = spaces.Discrete(4)
-        self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(8,), dtype=np.float32)
+        obs_size = 8 if self.obs_version == 1 else 9
+        self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(obs_size,), dtype=np.float32)
 
         self.hands: List[HandState] = []
         self.dealer_cards: List[Card] = []
@@ -62,6 +67,7 @@ class BlackjackEnv(gym.Env):
         self.round_step = 0
         self.events: List[dict] = []
         self.last_info: Dict[str, Any] = {}
+        self._pending_terminal_reward: Optional[float] = None
 
     def _log(self, event_type: str, **payload: Any) -> None:
         if self.record_events:
@@ -119,24 +125,50 @@ class BlackjackEnv(gym.Env):
         )
 
     def _obs(self) -> np.ndarray:
+        if not self.hands or self.current_hand_idx >= len(self.hands):
+            return np.zeros(self.observation_space.shape, dtype=np.float32)
         hand = self.hands[self.current_hand_idx]
-        total, usable = self.hand_value(hand.cards)
-        total = min(total, 22)
-        num_cards = min(len(hand.cards), 8)
-        remaining = sum(1 for h in self.hands[self.current_hand_idx + 1 :] if not h.done)
-        obs = np.array(
-            [
-                total / 22.0,
-                float(usable),
-                self._dealer_upcard_value() / 10.0,
-                float(self._can_double(hand)),
-                float(self._can_split(hand)),
-                num_cards / 8.0,
-                float(self._is_first_decision(hand)),
-                remaining / 3.0,
-            ],
-            dtype=np.float32,
+        return self.obs_from_cards(
+            player_cards=hand.cards,
+            dealer_upcard=self.dealer_cards[0],
+            force_can_split=self._can_split(hand),
+            force_can_double=self._can_double(hand),
+            remaining_hands=sum(1 for h in self.hands[self.current_hand_idx + 1 :] if not h.done),
+            is_first_decision=self._is_first_decision(hand),
         )
+
+    def obs_from_cards(
+        self,
+        player_cards: List[Card],
+        dealer_upcard: Card,
+        force_can_split: Optional[bool] = None,
+        force_can_double: Optional[bool] = None,
+        remaining_hands: int = 0,
+        is_first_decision: bool = True,
+    ) -> np.ndarray:
+        total, usable = self.hand_value(player_cards)
+        total = min(total, 22)
+        num_cards = min(len(player_cards), 8)
+        can_double = bool(force_can_double) if force_can_double is not None else (len(player_cards) == 2)
+        can_split = False
+        if force_can_split is not None:
+            can_split = bool(force_can_split)
+        elif len(player_cards) == 2:
+            can_split = player_cards[0].rank_value == player_cards[1].rank_value
+
+        obs_vals = [
+            total / 22.0,
+            float(usable),
+            min(10, dealer_upcard.value) / 10.0,
+            float(can_double),
+            float(can_split),
+            num_cards / 8.0,
+            float(is_first_decision),
+            min(remaining_hands, 3) / 3.0,
+        ]
+        if self.obs_version == 2:
+            obs_vals.append(float(dealer_upcard.rank == "A"))
+        obs = np.array(obs_vals, dtype=np.float32)
         return obs
 
     def _draw_to_hand(self, hand: HandState, owner: str, hand_index: int) -> None:
@@ -229,6 +261,7 @@ class BlackjackEnv(gym.Env):
         if seed is not None:
             self.rng.seed(seed)
         self.terminated = False
+        self._pending_terminal_reward = None
         self.round_step = 0
         self.events = []
         self._deal_initial()
@@ -245,13 +278,18 @@ class BlackjackEnv(gym.Env):
             self.current_hand_idx = 1
             reward = self._resolve_round()
             self.terminated = True
+            self._pending_terminal_reward = reward
             return np.zeros(self.observation_space.shape, dtype=np.float32), {**self.last_info, "immediate_reward": reward}
 
         return self._obs(), {"shoe_meta": self.shoe.to_meta(), "action_mask": self.action_masks()}
 
     def step(self, action: int):
         if self.terminated:
-            return np.zeros(self.observation_space.shape, dtype=np.float32), 0.0, True, False, self.last_info
+            reward = 0.0
+            if self._pending_terminal_reward is not None:
+                reward = self._pending_terminal_reward
+                self._pending_terminal_reward = None
+            return np.zeros(self.observation_space.shape, dtype=np.float32), reward, True, False, self.last_info
 
         self.round_step += 1
         hand = self.hands[self.current_hand_idx]

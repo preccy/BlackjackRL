@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import platform
 import time
@@ -13,6 +14,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 
 from blackjack_env import BlackjackEnv
 from callbacks.eval_callback import TrainingEvalCallback
+from imitation_pretrain import run_basic_strategy_pretrain
 
 
 ActionMasker = None
@@ -58,11 +60,9 @@ def mask_fn(env):
     )
 
 
-def make_env(rank: int, base_seed: int):
+def make_env(rank: int, base_seed: int, obs_version: int):
     def _init():
-        env = BlackjackEnv(seed=base_seed + rank)
-        # Keep Monitor statistics while ensuring mask_fn receives the base env.
-        # This wrapper order avoids ActionMasker passing a Monitor into mask_fn.
+        env = BlackjackEnv(seed=base_seed + rank, obs_version=obs_version)
         if ActionMasker is not None:
             env = ActionMasker(env, mask_fn)
         return Monitor(env)
@@ -139,6 +139,25 @@ def resolve_device(requested: str) -> str:
     return requested
 
 
+def _save_meta(model_out: str, obs_version: int) -> None:
+    model_path = Path(model_out)
+    meta_path = model_path.with_suffix(model_path.suffix + ".meta.json") if model_path.suffix else Path(f"{model_out}.meta.json")
+    meta = {
+        "env": {
+            "n_decks": 6,
+            "penetration": 0.25,
+            "dealer_stands_soft17": True,
+            "blackjack_payout": 1.5,
+            "das": True,
+            "max_hands": 4,
+            "illegal_action_penalty": -0.05,
+            "obs_version": obs_version,
+        }
+    }
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    print(f"Saved metadata to {meta_path}")
+
+
 def main() -> None:
     global ActionMasker
 
@@ -156,6 +175,10 @@ def main() -> None:
     parser.add_argument("--model-in", type=str, default=None, help="Optional checkpoint to continue training from.")
     parser.add_argument("--train-eval-freq", type=int, default=100_000)
     parser.add_argument("--train-eval-hands", type=int, default=20_000)
+    parser.add_argument("--obs-version", type=int, choices=[1, 2], default=1)
+    parser.add_argument("--pretrain-basic-strategy", action="store_true")
+    parser.add_argument("--pretrain-epochs", type=int, default=5)
+    parser.add_argument("--pretrain-samples", type=int, default=200_000)
     parser.add_argument(
         "--masking",
         action="store_true",
@@ -172,10 +195,12 @@ def main() -> None:
     parser.set_defaults(progress=True)
     args = parser.parse_args()
 
+    if args.pretrain_basic_strategy and args.obs_version != 2:
+        raise ValueError("--pretrain-basic-strategy requires --obs-version 2 (dealer Ace must be observable).")
+
     device = resolve_device(args.device)
     configure_cpu_runtime(args, device)
     affinity_status = apply_cpu_affinity(parse_cpu_affinity(args.cpu_affinity))
-
 
     maskable_available = False
     maskable_error = None
@@ -190,10 +215,7 @@ def main() -> None:
         maskable_available = True
     except Exception as exc:
         maskable_error = exc
-        print(
-            "MaskablePPO unavailable, falling back to vanilla PPO "
-            "(illegal action fallback/penalty behavior applies)."
-        )
+        print("MaskablePPO unavailable, falling back to vanilla PPO (illegal action fallback/penalty behavior applies).")
 
     if args.masking and not maskable_available and not args.allow_unmasked_fallback:
         raise RuntimeError(
@@ -207,21 +229,16 @@ def main() -> None:
     elif not maskable_available:
         use_maskable = False
 
-    if use_maskable:
-        env_fns = [make_env(rank, args.seed) for rank in range(args.n_envs)]
-        env, actual_vec_env = build_vec_env(args.n_envs, env_fns, args.vec_env)
-        algo_cls = MaskablePPO
-        masking_enabled = True
-    else:
-        env_fns = [make_env(rank, args.seed) for rank in range(args.n_envs)]
-        env, actual_vec_env = build_vec_env(args.n_envs, env_fns, args.vec_env)
-        algo_cls = PPO
-        masking_enabled = False
+    env_fns = [make_env(rank, args.seed, args.obs_version) for rank in range(args.n_envs)]
+    env, actual_vec_env = build_vec_env(args.n_envs, env_fns, args.vec_env)
+    algo_cls = MaskablePPO if use_maskable else PPO
+    masking_enabled = use_maskable
 
     print("=== Training startup configuration ===")
     print(f"Selected device: {device}")
     print(f"Algorithm: {algo_cls.__name__}")
     print(f"Masking enabled: {masking_enabled}")
+    print(f"Observation version: {args.obs_version}")
     print(f"Vector env setup: base_seed={args.seed}, n_envs={args.n_envs}, vec_env={actual_vec_env}")
     print(f"torch num threads: {torch.get_num_threads()}")
     print(f"torch interop threads: {torch.get_num_interop_threads()}")
@@ -257,10 +274,23 @@ def main() -> None:
     else:
         model = algo_cls(**model_kwargs)
 
+    if args.pretrain_basic_strategy:
+        pretrain_env = BlackjackEnv(seed=args.seed, obs_version=2)
+        stats = run_basic_strategy_pretrain(
+            model,
+            pretrain_env,
+            epochs=args.pretrain_epochs,
+            samples=args.pretrain_samples,
+            seed=args.seed,
+        )
+        print(
+            f"Pretraining complete: samples={stats.samples}, epochs={stats.epochs}, final_loss={stats.final_loss:.4f}"
+        )
+
     eval_env_seed_base = args.seed + 100_000
 
     def make_eval_env():
-        return BlackjackEnv(seed=eval_env_seed_base, record_events=False)
+        return BlackjackEnv(seed=eval_env_seed_base, record_events=False, obs_version=args.obs_version)
 
     callback = TrainingEvalCallback(
         eval_env_fn=make_eval_env,
@@ -283,6 +313,7 @@ def main() -> None:
     elapsed = max(1e-9, time.perf_counter() - start)
     Path(args.model_out).parent.mkdir(parents=True, exist_ok=True)
     model.save(args.model_out)
+    _save_meta(args.model_out, obs_version=args.obs_version)
     print(f"Saved model to {args.model_out}.zip")
     print(f"Total timesteps seen: {model.num_timesteps}")
     print(f"Elapsed wall time: {elapsed:.2f}s")

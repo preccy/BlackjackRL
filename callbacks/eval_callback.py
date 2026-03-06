@@ -75,9 +75,20 @@ class TrainingEvalCallback(BaseCallback):
 
         try:
             for hand_idx in range(self.n_eval_hands):
-                obs, _ = eval_env.reset(seed=hand_idx)
+                obs, info = eval_env.reset(seed=hand_idx)
                 done = False
-                final_info = {}
+                final_info = info
+
+                if getattr(eval_env, "terminated", False) or "immediate_reward" in info:
+                    mask = self._get_action_mask(eval_env)
+                    dummy_action = 0
+                    if using_maskable and mask is not None:
+                        action, _ = self.model.predict(obs, deterministic=self.deterministic, action_masks=mask)
+                        dummy_action = int(action)
+                    obs, reward, terminated, truncated, info = eval_env.step(dummy_action)
+                    total_reward += reward
+                    done = terminated or truncated
+                    final_info = info
 
                 while not done:
                     if using_maskable:

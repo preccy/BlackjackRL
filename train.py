@@ -14,7 +14,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 
 from blackjack_env import BlackjackEnv
 from callbacks.eval_callback import TrainingEvalCallback
-from imitation_pretrain import run_basic_strategy_pretrain
+from imitation_pretrain import parse_bet_levels, run_basic_strategy_pretrain, validate_pretrain_config
 
 
 ActionMasker = None
@@ -200,6 +200,7 @@ def main() -> None:
     parser.add_argument("--pretrain-basic-strategy", action="store_true")
     parser.add_argument("--pretrain-epochs", type=int, default=5)
     parser.add_argument("--pretrain-samples", type=int, default=200_000)
+    parser.add_argument("--pretrain-bet-mode", choices=["minbet"], default="minbet")
     parser.add_argument(
         "--masking",
         action="store_true",
@@ -221,12 +222,10 @@ def main() -> None:
     parser.set_defaults(progress=True)
     args = parser.parse_args()
 
-    if args.pretrain_basic_strategy and args.obs_version != 2:
-        raise ValueError("--pretrain-basic-strategy requires --obs-version 2 (dealer Ace must be observable).")
+    bet_levels = parse_bet_levels(args.bet_levels)
 
-    bet_levels = [float(tok.strip()) for tok in args.bet_levels.split(",") if tok.strip()]
-    if not bet_levels:
-        raise ValueError("--bet-levels must contain at least one positive bet")
+    if args.pretrain_basic_strategy:
+        validate_pretrain_config(args.obs_version, args.enable_betting, bet_levels)
 
     device = resolve_device(args.device)
     configure_cpu_runtime(args, device)
@@ -340,13 +339,22 @@ def main() -> None:
         model = algo_cls(**model_kwargs)
 
     if args.pretrain_basic_strategy:
-        pretrain_env = BlackjackEnv(seed=args.seed, obs_version=2, episode_mode="hand")
+        pretrain_env = BlackjackEnv(
+            seed=args.seed,
+            obs_version=args.obs_version,
+            episode_mode="hand",
+            enable_betting=args.enable_betting,
+            bet_levels=bet_levels,
+        )
         stats = run_basic_strategy_pretrain(
             model,
             pretrain_env,
             epochs=args.pretrain_epochs,
             samples=args.pretrain_samples,
             seed=args.seed,
+            enable_betting=args.enable_betting,
+            bet_levels=bet_levels,
+            pretrain_bet_mode=args.pretrain_bet_mode,
         )
         print(
             f"Pretraining complete: samples={stats.samples}, epochs={stats.epochs}, final_loss={stats.final_loss:.4f}"

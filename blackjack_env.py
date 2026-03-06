@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import copy
 from typing import Any, Dict, List, Optional
 import random
 
@@ -289,6 +290,29 @@ class BlackjackEnv(gym.Env):
         }
         return total_reward
 
+    def _build_round_end_payload(self, round_reward: float, reshuffle_happened: bool) -> Dict[str, Any]:
+        last_info = copy.deepcopy(self.last_info)
+        return {
+            "outcomes": last_info.get("outcomes", []),
+            "total_reward": last_info.get("total_reward", round_reward),
+            "dealer_hand": last_info.get("dealer_hand", []),
+            "player_hands": last_info.get("player_hands", []),
+            "actions_taken": last_info.get("actions_taken", []),
+            "events": last_info.get("events", []),
+            "shoe_meta": last_info.get("shoe_meta", self.shoe.to_meta()),
+            "round_end": True,
+            "round_reward": round_reward,
+            "rounds_in_episode": self.rounds_in_episode,
+            "reshuffle_happened": reshuffle_happened,
+            "round_replay": {
+                "shoe_meta": last_info.get("shoe_meta", self.shoe.to_meta()),
+                "dealer_hand": last_info.get("dealer_hand", []),
+                "player_hands": last_info.get("player_hands", []),
+                "events": last_info.get("events", []),
+                "info": last_info,
+            },
+        }
+
     def _dealer_peek_blackjack(self) -> bool:
         if not self.dealer_cards:
             return False
@@ -352,19 +376,36 @@ class BlackjackEnv(gym.Env):
                 self.last_round_revealed_cards = self._collect_revealed_cards()
                 round_reshuffle = self._reshuffle_happened_this_round
                 reshuffle_happened = reshuffle_happened or round_reshuffle
+                round_payload = self._build_round_end_payload(reward, round_reshuffle)
                 max_rounds_hit = self.episode_mode == "shoe" and self.rounds_in_episode >= self.max_rounds_per_episode
                 if self.episode_mode == "hand" or round_reshuffle or max_rounds_hit:
                     info = {
-                        **self.last_info,
-                        "shoe_meta": self.shoe.to_meta(),
-                        "round_end": True,
-                        "round_reward": reward,
-                        "rounds_in_episode": self.rounds_in_episode,
-                        "reshuffle_happened": round_reshuffle,
+                        **round_payload,
                         "action_mask": np.array([True, False, False, False], dtype=bool),
                     }
                     return np.zeros(self.observation_space.shape, dtype=np.float32), info, auto_reward, True
-                continue
+
+                next_obs, next_info, next_auto_reward, next_terminated = self._start_round()
+                auto_reward += next_auto_reward
+                if next_terminated:
+                    info = {
+                        **next_info,
+                        **round_payload,
+                        "reshuffle_happened": bool(
+                            round_payload["reshuffle_happened"] or next_info.get("reshuffle_happened", False)
+                        ),
+                        "action_mask": np.array([True, False, False, False], dtype=bool),
+                    }
+                    return np.zeros(self.observation_space.shape, dtype=np.float32), info, auto_reward, True
+
+                info = {
+                    **next_info,
+                    **round_payload,
+                    "reshuffle_happened": bool(
+                        round_payload["reshuffle_happened"] or next_info.get("reshuffle_happened", False)
+                    ),
+                }
+                return next_obs, info, auto_reward, False
 
             info = {
                 "shoe_meta": self.shoe.to_meta(),
@@ -428,16 +469,13 @@ class BlackjackEnv(gym.Env):
             self.last_round_revealed_cards = self._collect_revealed_cards()
             reshuffle_happened = self._reshuffle_happened_this_round
             max_rounds_hit = self.episode_mode == "shoe" and self.rounds_in_episode >= self.max_rounds_per_episode
+            round_payload = self._build_round_end_payload(round_reward, reshuffle_happened)
 
             if self.episode_mode == "hand" or reshuffle_happened or max_rounds_hit:
                 self.terminated = True
                 return np.zeros(self.observation_space.shape, dtype=np.float32), reward, True, False, {
-                    **self.last_info,
+                    **round_payload,
                     "action_mask": np.array([True, False, False, False], dtype=bool),
-                    "round_end": True,
-                    "round_reward": round_reward,
-                    "rounds_in_episode": self.rounds_in_episode,
-                    "reshuffle_happened": reshuffle_happened,
                 }
 
             next_obs, next_info, auto_reward, auto_terminated = self._start_round()
@@ -445,20 +483,16 @@ class BlackjackEnv(gym.Env):
             if auto_terminated:
                 self.terminated = True
                 return np.zeros(self.observation_space.shape, dtype=np.float32), reward, True, False, {
+                    **round_payload,
                     **next_info,
-                    "round_end": True,
-                    "round_reward": round_reward,
-                    "rounds_in_episode": self.rounds_in_episode,
-                    "reshuffle_happened": bool(next_info.get("reshuffle_happened", False) or reshuffle_happened),
+                    "reshuffle_happened": bool(round_payload["reshuffle_happened"] or next_info.get("reshuffle_happened", False)),
                     "action_mask": np.array([True, False, False, False], dtype=bool),
                 }
 
             return next_obs, reward, False, False, {
+                **round_payload,
                 **next_info,
-                "round_end": True,
-                "round_reward": round_reward,
-                "rounds_in_episode": self.rounds_in_episode,
-                "reshuffle_happened": bool(next_info.get("reshuffle_happened", False) or reshuffle_happened),
+                "reshuffle_happened": bool(round_payload["reshuffle_happened"] or next_info.get("reshuffle_happened", False)),
             }
 
         info = {

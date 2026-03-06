@@ -13,7 +13,7 @@ from replay_logger import save_replay_bundle
 
 
 def pick_interesting(info: dict) -> bool:
-    outcomes = info.get("outcomes", [])
+    outcomes = info.get("outcomes") or info.get("info", {}).get("outcomes", [])
     labels = {o["outcome"] for o in outcomes}
     return any(
         key in labels
@@ -131,19 +131,43 @@ def main() -> None:
     start = time.perf_counter()
     episode_rewards = []
     episode_count = 0
-    resolved_hands = 0
+    resolved_rounds = 0
+    resolved_hands_total = 0
     wins = pushes = losses = blackjacks = 0
     interesting = []
+
+    def process_round_info(round_info: dict) -> bool:
+        nonlocal resolved_rounds, resolved_hands_total, wins, pushes, losses, blackjacks, interesting
+        outcomes = round_info.get("outcomes")
+        round_finished = round_info.get("round_end", bool(outcomes))
+        if not round_finished:
+            return False
+        outcomes = outcomes or getattr(env, "last_info", {}).get("outcomes", [])
+        resolved_rounds += 1
+        resolved_hands_total += len(outcomes)
+        for out in outcomes:
+            if out["reward"] > 0:
+                wins += 1
+            elif out["reward"] == 0:
+                pushes += 1
+            else:
+                losses += 1
+            if out["outcome"] in {"win_blackjack", "push_blackjack"}:
+                blackjacks += 1
+        if len(interesting) < args.save_replays and pick_interesting(round_info):
+            interesting.append(round_info.get("round_replay") or env.export_episode())
+        return True
 
     obs = None
     info = {}
     reset_seed = 0
-    while resolved_hands < args.hands:
+    while resolved_rounds < args.hands:
         if obs is None:
             obs, info = env.reset(seed=reset_seed)
             reset_seed += 1
             episode_count += 1
             episode_rewards.append(0.0)
+            process_round_info(info)
 
         if env.terminated or "immediate_reward" in info:
             mask = get_action_mask(env)
@@ -154,22 +178,7 @@ def main() -> None:
             obs, r, term, trunc, info = env.step(dummy_action)
             episode_rewards[-1] += r
             if term or trunc:
-                final_info = info
-                outcomes = final_info.get("outcomes", [])
-                round_finished = final_info.get("round_end", bool(outcomes))
-                if round_finished:
-                    resolved_hands += 1
-                    for out in outcomes:
-                        if out["reward"] > 0:
-                            wins += 1
-                        elif out["reward"] == 0:
-                            pushes += 1
-                        else:
-                            losses += 1
-                        if out["outcome"] in {"win_blackjack", "push_blackjack"}:
-                            blackjacks += 1
-                    if len(interesting) < args.save_replays and pick_interesting(final_info):
-                        interesting.append(env.export_episode())
+                process_round_info(info)
                 obs = None
             continue
 
@@ -188,46 +197,36 @@ def main() -> None:
         obs, r, term, trunc, info = env.step(int(action))
         episode_rewards[-1] += r
 
-        outcomes = info.get("outcomes", [])
-        round_finished = info.get("round_end", bool(outcomes))
-        if round_finished:
-            resolved_hands += 1
-            for out in outcomes:
-                if out["reward"] > 0:
-                    wins += 1
-                elif out["reward"] == 0:
-                    pushes += 1
-                else:
-                    losses += 1
-                if out["outcome"] in {"win_blackjack", "push_blackjack"}:
-                    blackjacks += 1
-            if len(interesting) < args.save_replays and pick_interesting(info):
-                interesting.append(env.export_episode())
+        round_finished = process_round_info(info)
 
         if term or trunc:
             obs = None
 
         if progress is not None and round_finished:
             progress.update(1)
-            if resolved_hands % max(1, args.progress_update_every) == 0 or resolved_hands >= args.hands:
+            if resolved_rounds % max(1, args.progress_update_every) == 0 or resolved_rounds >= args.hands:
                 elapsed = max(1e-9, time.perf_counter() - start)
-                denom_hands = max(1, resolved_hands)
+                denom_rounds = max(1, resolved_rounds)
+                denom_hands = max(1, resolved_hands_total)
                 progress.set_postfix(
-                    resolved=resolved_hands,
-                    ev=f"{(np.sum(episode_rewards) / denom_hands):.4f}",
+                    rounds=resolved_rounds,
+                    hands=resolved_hands_total,
+                    ev=f"{(np.sum(episode_rewards) / denom_rounds):.4f}",
                     win_rate=f"{wins / denom_hands:.3f}",
                     net=f"{np.sum(episode_rewards):.1f}",
-                    hps=f"{resolved_hands / elapsed:.1f}",
+                    rps=f"{resolved_rounds / elapsed:.1f}",
                 )
 
     if progress is not None:
         progress.close()
 
-    denom_hands = max(1, resolved_hands)
+    denom_rounds = max(1, resolved_rounds)
+    denom_hands = max(1, resolved_hands_total)
     print(f"Episodes played: {episode_count}")
-    print(f"Resolved hands: {resolved_hands}")
+    print(f"Resolved rounds: {resolved_rounds}")
+    print(f"Resolved hands: {resolved_hands_total}")
     total_net = float(np.sum(episode_rewards))
-    print(f"EV per round: {total_net / denom_hands:.5f}")
+    print(f"EV per round: {total_net / denom_rounds:.5f}")
     print(f"Win rate (resolved hands): {wins / denom_hands:.5f}")
     print(f"Push rate (resolved hands): {pushes / denom_hands:.5f}")
     print(f"Loss rate (resolved hands): {losses / denom_hands:.5f}")

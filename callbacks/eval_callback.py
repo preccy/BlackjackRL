@@ -70,17 +70,35 @@ class TrainingEvalCallback(BaseCallback):
         wins = 0
         losses = 0
         pushes = 0
-        resolved_hands = 0
+        resolved_rounds = 0
+        resolved_hands_total = 0
         total_reward = 0.0
+
+        def process_round_info(round_info):
+            nonlocal resolved_rounds, resolved_hands_total, wins, pushes, losses
+            outcomes = round_info.get("outcomes") or getattr(eval_env, "last_info", {}).get("outcomes", [])
+            if not round_info.get("round_end", bool(outcomes)):
+                return
+            resolved_rounds += 1
+            resolved_hands_total += len(outcomes)
+            for outcome in outcomes:
+                r = outcome.get("reward", 0)
+                if r > 0:
+                    wins += 1
+                elif r == 0:
+                    pushes += 1
+                else:
+                    losses += 1
 
         try:
             obs = None
             info = {}
             reset_seed = 0
-            while resolved_hands < self.n_eval_hands:
+            while resolved_rounds < self.n_eval_hands:
                 if obs is None:
                     obs, info = eval_env.reset(seed=reset_seed)
                     reset_seed += 1
+                    process_round_info(info)
 
                 if getattr(eval_env, "terminated", False) or "immediate_reward" in info:
                     mask = self._get_action_mask(eval_env)
@@ -91,17 +109,7 @@ class TrainingEvalCallback(BaseCallback):
                     obs, reward, terminated, truncated, info = eval_env.step(dummy_action)
                     total_reward += reward
                     if terminated or truncated:
-                        outcomes = info.get("outcomes", [])
-                        if info.get("round_end", bool(outcomes)):
-                            resolved_hands += 1
-                            for outcome in outcomes:
-                                r = outcome.get("reward", 0)
-                                if r > 0:
-                                    wins += 1
-                                elif r == 0:
-                                    pushes += 1
-                                else:
-                                    losses += 1
+                        process_round_info(info)
                         obs = None
                     continue
 
@@ -124,31 +132,23 @@ class TrainingEvalCallback(BaseCallback):
 
                 obs, reward, terminated, truncated, info = eval_env.step(int(action))
                 total_reward += reward
-                outcomes = info.get("outcomes", [])
-                if info.get("round_end", bool(outcomes)):
-                    resolved_hands += 1
-                    for outcome in outcomes:
-                        r = outcome.get("reward", 0)
-                        if r > 0:
-                            wins += 1
-                        elif r == 0:
-                            pushes += 1
-                        else:
-                            losses += 1
+                process_round_info(info)
 
                 if terminated or truncated:
                     obs = None
         finally:
             eval_env.close()
 
-        denom = max(1, resolved_hands)
-        ev = total_reward / denom
-        win_rate = wins / denom
+        denom_rounds = max(1, resolved_rounds)
+        denom_hands = max(1, resolved_hands_total)
+        ev = total_reward / denom_rounds
+        win_rate = wins / denom_hands
 
         print("------------------------------------------------")
         print("[TRAIN EVAL]")
         print(f"Step: {self.num_timesteps}")
-        print(f"Hands: {resolved_hands}")
+        print(f"Rounds: {resolved_rounds}")
+        print(f"Hands: {resolved_hands_total}")
         print(f"EV: {ev:+.3f}")
         print(f"Win rate: {win_rate * 100:.1f}%")
         print(f"Net units: {total_reward:+.0f}")

@@ -352,6 +352,7 @@ class BlackjackEnv(gym.Env):
             "outcomes": outcomes,
             "total_reward": total_reward,
             "total_wagered": float(sum(hand.bet for hand in self.hands)),
+            "current_bet": float(self.current_bet),
             "final_bankroll_delta": total_reward,
             "dealer_hand": [c.to_dict() for c in self.dealer_cards],
             "player_hands": [[c.to_dict() for c in hand.cards] for hand in self.hands],
@@ -374,6 +375,7 @@ class BlackjackEnv(gym.Env):
             "round_end": True,
             "round_reward": round_reward,
             "total_wagered": last_info.get("total_wagered", 0.0),
+            "current_bet": last_info.get("current_bet", float(self.current_bet)),
             "rounds_in_episode": self.rounds_in_episode,
             "reshuffle_happened": reshuffle_happened,
             "round_replay": {
@@ -547,6 +549,48 @@ class BlackjackEnv(gym.Env):
                 shoe_meta=self.shoe.to_meta(),
                 selected_bet=self.current_bet,
             )
+
+            if self._dealer_peek_blackjack() or self.is_blackjack(self.hands[0].cards):
+                self.hands[0].done = True
+                self.current_hand_idx = 1
+                round_reward = self._resolve_round()
+                reward += round_reward
+                round_reshuffle = self._reshuffle_happened_this_round
+                round_payload = self._finalize_round(round_reward, round_reshuffle)
+                max_rounds_hit = self.episode_mode == "shoe" and self.rounds_in_episode >= self.max_rounds_per_episode
+                bankroll_bust = self.bankroll_start is not None and self.bankroll_stop_on_zero and self.bankroll_current <= 0
+
+                if self.episode_mode == "hand" or round_reshuffle or max_rounds_hit or bankroll_bust:
+                    self.terminated = True
+                    return np.zeros(self.observation_space.shape, dtype=np.float32), reward, True, False, {
+                        **round_payload,
+                        "action_mask": self._terminated_action_mask(),
+                        "phase": "TERMINATED",
+                    }
+
+                next_obs, next_info, next_auto_reward, next_terminated = self._start_round()
+                reward += next_auto_reward
+                if next_terminated:
+                    self.terminated = True
+                    return np.zeros(self.observation_space.shape, dtype=np.float32), reward, True, False, {
+                        **next_info,
+                        **round_payload,
+                        "reshuffle_happened": bool(
+                            round_payload["reshuffle_happened"] or next_info.get("reshuffle_happened", False)
+                        ),
+                        "action_mask": self._terminated_action_mask(),
+                        "phase": "TERMINATED",
+                    }
+
+                info = {
+                    **next_info,
+                    **round_payload,
+                    "reshuffle_happened": bool(
+                        round_payload["reshuffle_happened"] or next_info.get("reshuffle_happened", False)
+                    ),
+                }
+                return next_obs, reward, False, False, info
+
             info = {
                 "action_mask": self.action_masks(),
                 "shoe_meta": self.shoe.to_meta(),

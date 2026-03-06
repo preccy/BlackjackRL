@@ -44,6 +44,8 @@ def test_bet_step_immediately_resolves_dealer_peek_blackjack_loss() -> None:
     assert any(outcome["outcome"] == "loss_dealer_blackjack" for outcome in info["outcomes"])
     assert info["total_wagered"] == 1.0
     assert info["current_bet"] == 1.0
+    assert info["actions_taken"] == [[]]
+    assert info["player_hands"][0] == [{"rank": "9", "suit": "♠", "value": 9}, {"rank": "7", "suit": "♦", "value": 7}]
     assert reward == -1.0
 
 
@@ -69,4 +71,5 @@ def test_bet_step_immediately_resolves_push_blackjack_vs_dealer_blackjack() -> N
     assert any(outcome["outcome"] == "push_blackjack" for outcome in info["outcomes"])
     assert info["total_wagered"] == 1.0
     assert info["current_bet"] == 1.0
+    assert info["actions_taken"] == [[]]
     assert reward == 0.0

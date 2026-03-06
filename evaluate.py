@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -169,15 +170,21 @@ def main() -> None:
     wins = pushes = losses = blackjacks = 0
     interesting = []
     total_wagered = 0.0
+    bet_counter: Counter[float] = Counter()
 
     def process_round_info(round_info: dict) -> bool:
-        nonlocal resolved_rounds, resolved_hands_total, wins, pushes, losses, blackjacks, interesting, total_wagered
+        nonlocal resolved_rounds, resolved_hands_total, wins, pushes, losses, blackjacks, interesting, total_wagered, bet_counter
         outcomes = round_info.get("outcomes")
         round_finished = round_info.get("round_end", bool(outcomes))
         if not round_finished:
             return False
         outcomes = outcomes or getattr(env, "last_info", {}).get("outcomes", [])
         total_wagered += float(round_info.get("total_wagered", sum(out.get("bet", 0.0) for out in outcomes)))
+        if args.enable_betting:
+            try:
+                bet_counter[float(round_info.get("current_bet", env.current_bet))] += 1
+            except (TypeError, ValueError):
+                pass
         resolved_rounds += 1
         resolved_hands_total += len(outcomes)
         for out in outcomes:
@@ -283,10 +290,18 @@ def main() -> None:
     denom_wagered = max(1e-9, total_wagered)
     print(f"ROI per unit wagered: {total_net / denom_wagered:.5f}")
     print(f"Total wagered (sum of resolved hand bets): {total_wagered:.2f}")
+    print(f"Average wager per round: {total_wagered / denom_rounds:.5f}")
+    print(f"Average wager per resolved hand: {total_wagered / denom_hands:.5f}")
     print(f"Win rate (resolved hands): {wins / denom_hands:.5f}")
     print(f"Push rate (resolved hands): {pushes / denom_hands:.5f}")
     print(f"Loss rate (resolved hands): {losses / denom_hands:.5f}")
     print(f"Blackjack rate (resolved hands): {blackjacks / denom_hands:.5f}")
+
+    if args.enable_betting:
+        print("Bet distribution:")
+        for level in bet_levels:
+            pct = 100.0 * bet_counter.get(float(level), 0) / denom_rounds
+            print(f"  {float(level):.1f}: {pct:.1f}%")
 
     if interesting:
         Path(args.replay_out).parent.mkdir(parents=True, exist_ok=True)

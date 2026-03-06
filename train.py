@@ -198,6 +198,11 @@ def main() -> None:
         action="store_true",
         help="Allow fallback to vanilla PPO when --masking is set but MaskablePPO is unavailable.",
     )
+    parser.add_argument(
+        "--recurrent",
+        action="store_true",
+        help="Use MaskableRecurrentPPO with MlpLstmPolicy (requires sb3-contrib maskable support).",
+    )
     progress_group = parser.add_mutually_exclusive_group()
     progress_group.add_argument("--progress", dest="progress", action="store_true")
     progress_group.add_argument("--no-progress", dest="progress", action="store_false")
@@ -213,7 +218,9 @@ def main() -> None:
 
     maskable_available = False
     maskable_error = None
+    recurrent_maskable_error = None
     MaskablePPO = None
+    MaskableRecurrentPPO = None
     ActionMasker = None
     try:
         from sb3_contrib import MaskablePPO as _MaskablePPO
@@ -226,11 +233,26 @@ def main() -> None:
         maskable_error = exc
         print("MaskablePPO unavailable, falling back to vanilla PPO (illegal action fallback/penalty behavior applies).")
 
+    if maskable_available:
+        try:
+            from sb3_contrib import MaskableRecurrentPPO as _MaskableRecurrentPPO
+
+            MaskableRecurrentPPO = _MaskableRecurrentPPO
+        except Exception as exc:
+            recurrent_maskable_error = exc
+            print("MaskableRecurrentPPO unavailable; --recurrent cannot be used in this environment.")
+
     if args.masking and not maskable_available and not args.allow_unmasked_fallback:
         raise RuntimeError(
             "--masking was requested but MaskablePPO could not be imported. "
             "Install sb3-contrib or pass --allow-unmasked-fallback to continue with PPO."
         ) from maskable_error
+
+    if args.recurrent and MaskableRecurrentPPO is None:
+        raise RuntimeError(
+            "--recurrent was requested but MaskableRecurrentPPO could not be imported. "
+            "Install/upgrade sb3-contrib to a version that includes MaskableRecurrentPPO."
+        ) from (recurrent_maskable_error or maskable_error)
 
     use_maskable = maskable_available
     if args.masking:
@@ -243,7 +265,10 @@ def main() -> None:
         for rank in range(args.n_envs)
     ]
     env, actual_vec_env = build_vec_env(args.n_envs, env_fns, args.vec_env)
-    algo_cls = MaskablePPO if use_maskable else PPO
+    if args.recurrent:
+        algo_cls = MaskableRecurrentPPO
+    else:
+        algo_cls = MaskablePPO if use_maskable else PPO
     masking_enabled = use_maskable
 
     print("=== Training startup configuration ===")
@@ -265,7 +290,7 @@ def main() -> None:
     print(f"Progress bar: {'enabled' if args.progress else 'disabled'}")
 
     model_kwargs = dict(
-        policy="MlpPolicy",
+        policy="MlpLstmPolicy" if args.recurrent else "MlpPolicy",
         env=env,
         verbose=1,
         tensorboard_log=args.tensorboard_log,

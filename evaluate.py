@@ -75,6 +75,15 @@ def get_action_mask(env: BlackjackEnv):
     return None
 
 
+def _is_maskable_recurrent_model(model) -> bool:
+    try:
+        from sb3_contrib import MaskableRecurrentPPO
+
+        return isinstance(model, MaskableRecurrentPPO)
+    except Exception:
+        return model.__class__.__name__ == "MaskableRecurrentPPO"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="./models/blackjack_ppo.zip")
@@ -95,14 +104,25 @@ def main() -> None:
     model = None
     using_maskable = False
     if args.algo in {"auto", "maskable"}:
+        load_errors = []
         try:
-            from sb3_contrib import MaskablePPO
+            from sb3_contrib import MaskableRecurrentPPO
 
-            model = MaskablePPO.load(args.model)
+            model = MaskableRecurrentPPO.load(args.model)
             using_maskable = True
-        except Exception:
-            if args.algo == "maskable":
-                raise
+        except Exception as exc:
+            load_errors.append(exc)
+
+        if model is None:
+            try:
+                from sb3_contrib import MaskablePPO
+
+                model = MaskablePPO.load(args.model)
+                using_maskable = True
+            except Exception as exc:
+                load_errors.append(exc)
+                if args.algo == "maskable":
+                    raise RuntimeError(f"Unable to load model as maskable algorithm: {load_errors!r}") from exc
 
     if model is None:
         model = PPO.load(args.model)
@@ -117,7 +137,11 @@ def main() -> None:
 
     mask_warning_printed = False
     mask_aware_predict = using_maskable or args.algo == "maskable"
+    using_recurrent = _is_maskable_recurrent_model(model)
+    state = None
+    episode_start = True
     print(f"Evaluation using mask-aware predict: {mask_aware_predict}")
+    print(f"Evaluation recurrent policy: {using_recurrent}")
 
     progress = None
     if args.progress:
@@ -158,6 +182,19 @@ def main() -> None:
             interesting.append(round_info.get("round_replay") or env.export_episode())
         return True
 
+    def predict_action(obs, mask):
+        nonlocal state, episode_start
+        kwargs = dict(deterministic=True)
+        if using_recurrent:
+            kwargs["state"] = state
+            kwargs["episode_start"] = np.array([episode_start], dtype=bool)
+        if using_maskable and mask is not None:
+            kwargs["action_masks"] = mask
+        action, next_state = model.predict(obs, **kwargs)
+        if using_recurrent:
+            state = next_state
+        return action
+
     obs = None
     info = {}
     reset_seed = 0
@@ -173,26 +210,27 @@ def main() -> None:
             mask = get_action_mask(env)
             dummy_action = 0
             if using_maskable and mask is not None:
-                action, _ = model.predict(obs, deterministic=True, action_masks=mask)
+                action = predict_action(obs, mask)
                 dummy_action = int(action)
             obs, r, term, trunc, info = env.step(dummy_action)
             episode_rewards[-1] += r
             if term or trunc:
                 process_round_info(info)
                 obs = None
+                episode_start = True
+                state = None
+            else:
+                episode_start = False
             continue
 
+        mask = None
         if using_maskable:
             mask = get_action_mask(env)
             if mask is None and not mask_warning_printed:
                 print("Warning: action masks unavailable during evaluation; continuing without masks.")
                 mask_warning_printed = True
-            if mask is not None:
-                action, _ = model.predict(obs, deterministic=True, action_masks=mask)
-            else:
-                action, _ = model.predict(obs, deterministic=True)
-        else:
-            action, _ = model.predict(obs, deterministic=True)
+
+        action = predict_action(obs, mask)
 
         obs, r, term, trunc, info = env.step(int(action))
         episode_rewards[-1] += r
@@ -201,6 +239,10 @@ def main() -> None:
 
         if term or trunc:
             obs = None
+            episode_start = True
+            state = None
+        else:
+            episode_start = False
 
         if progress is not None and round_finished:
             progress.update(1)

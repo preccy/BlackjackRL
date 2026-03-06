@@ -39,6 +39,9 @@ class BlackjackEnv(gym.Env):
         seed: Optional[int] = None,
         record_events: bool = False,
         obs_version: int = 1,
+        episode_mode: str = "hand",
+        max_rounds_per_episode: int = 200,
+        shuffle_on_reset: bool = True,
     ):
         super().__init__()
         self.n_decks = n_decks
@@ -49,15 +52,20 @@ class BlackjackEnv(gym.Env):
         self.max_hands = max_hands
         self.illegal_action_penalty = illegal_action_penalty
         self.record_events = record_events
-        if obs_version not in {1, 2}:
-            raise ValueError(f"Unsupported obs_version={obs_version}; expected 1 or 2.")
+        if obs_version not in {1, 2, 3}:
+            raise ValueError(f"Unsupported obs_version={obs_version}; expected 1, 2, or 3.")
+        if episode_mode not in {"hand", "shoe"}:
+            raise ValueError(f"Unsupported episode_mode={episode_mode}; expected 'hand' or 'shoe'.")
         self.obs_version = obs_version
+        self.episode_mode = episode_mode
+        self.max_rounds_per_episode = max(1, int(max_rounds_per_episode))
+        self.shuffle_on_reset = bool(shuffle_on_reset)
 
         self.rng = random.Random(seed)
         self.shoe = Shoe(n_decks=n_decks, penetration=penetration, rng=self.rng)
 
         self.action_space = spaces.Discrete(4)
-        obs_size = 8 if self.obs_version == 1 else 9
+        obs_size = 8 if self.obs_version == 1 else (9 if self.obs_version == 2 else 20)
         self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(obs_size,), dtype=np.float32)
 
         self.hands: List[HandState] = []
@@ -68,6 +76,9 @@ class BlackjackEnv(gym.Env):
         self.events: List[dict] = []
         self.last_info: Dict[str, Any] = {}
         self._pending_terminal_reward: Optional[float] = None
+        self.rounds_in_episode = 0
+        self.last_round_revealed_cards: List[Card] = []
+        self._reshuffle_happened_this_round = False
 
     def _log(self, event_type: str, **payload: Any) -> None:
         if self.record_events:
@@ -166,25 +177,54 @@ class BlackjackEnv(gym.Env):
             float(is_first_decision),
             min(remaining_hands, 3) / 3.0,
         ]
-        if self.obs_version == 2:
+        if self.obs_version in {2, 3}:
             obs_vals.append(float(dealer_upcard.rank == "A"))
+        if self.obs_version == 3:
+            obs_vals.extend(self._last_round_rank_bins())
+            deck_size = max(1, 52 * self.n_decks)
+            obs_vals.append(min(1.0, self.shoe.cards_remaining / deck_size))
         obs = np.array(obs_vals, dtype=np.float32)
         return obs
 
-    def _draw_to_hand(self, hand: HandState, owner: str, hand_index: int) -> None:
+    def _last_round_rank_bins(self) -> List[float]:
+        bins = {"A": 0, "2": 0, "3": 0, "4": 0, "5": 0, "6": 0, "7": 0, "8": 0, "9": 0, "T": 0}
+        for card in self.last_round_revealed_cards:
+            rank = card.rank
+            if rank in {"T", "J", "Q", "K"}:
+                bins["T"] += 1
+            elif rank in bins:
+                bins[rank] += 1
+        return [min(20, bins[key]) / 20.0 for key in ["A", "2", "3", "4", "5", "6", "7", "8", "9", "T"]]
+
+    def _draw_card(self) -> Card:
+        prev_shuffle_count = self.shoe.shuffle_count
         card = self.shoe.draw()
+        self._reshuffle_happened_this_round = self._reshuffle_happened_this_round or (
+            self.shoe.shuffle_count != prev_shuffle_count
+        )
+        return card
+
+    def _draw_to_hand(self, hand: HandState, owner: str, hand_index: int) -> None:
+        card = self._draw_card()
         hand.cards.append(card)
         self._log("deal_card", to=owner, hand_index=hand_index, card=card.to_dict())
 
     def _deal_initial(self) -> None:
+        self._reshuffle_happened_this_round = False
         self.hands = [HandState()]
         self.dealer_cards = []
         self.current_hand_idx = 0
         for _ in range(2):
             self._draw_to_hand(self.hands[0], "player", 0)
-            d_card = self.shoe.draw()
+            d_card = self._draw_card()
             self.dealer_cards.append(d_card)
             self._log("deal_card", to="dealer", hand_index=0, card=d_card.to_dict())
+
+    def _collect_revealed_cards(self) -> List[Card]:
+        cards = self.dealer_cards[:]
+        for hand in self.hands:
+            cards.extend(hand.cards)
+        return cards
 
     def _advance_hand(self) -> None:
         while self.current_hand_idx < len(self.hands) and self.hands[self.current_hand_idx].done:
@@ -205,7 +245,7 @@ class BlackjackEnv(gym.Env):
     def _resolve_round(self) -> float:
         dealer_total, _ = self.hand_value(self.dealer_cards)
         while self._dealer_should_hit():
-            c = self.shoe.draw()
+            c = self._draw_card()
             self.dealer_cards.append(c)
             self._log("dealer_play", action="hit", card=c.to_dict())
             dealer_total, _ = self.hand_value(self.dealer_cards)
@@ -263,25 +303,76 @@ class BlackjackEnv(gym.Env):
         self.terminated = False
         self._pending_terminal_reward = None
         self.round_step = 0
+        self.rounds_in_episode = 0
+        self.last_round_revealed_cards = []
         self.events = []
-        self._deal_initial()
-        self._log(
-            "initial_state",
-            player_initial=[c.to_dict() for c in self.hands[0].cards],
-            dealer_upcard=self.dealer_cards[0].to_dict(),
-            dealer_hole_card=self.dealer_cards[1].to_dict(),
-            shoe_meta=self.shoe.to_meta(),
-        )
 
-        if self._dealer_peek_blackjack() or self.is_blackjack(self.hands[0].cards):
-            self.hands[0].done = True
-            self.current_hand_idx = 1
-            reward = self._resolve_round()
+        if self.episode_mode == "shoe" and self.shuffle_on_reset:
+            self.shoe._init_cards()
+
+        obs, info, auto_reward, terminated = self._start_round()
+        if terminated:
             self.terminated = True
-            self._pending_terminal_reward = reward
-            return np.zeros(self.observation_space.shape, dtype=np.float32), {**self.last_info, "immediate_reward": reward}
+            self._pending_terminal_reward = auto_reward
+            return np.zeros(self.observation_space.shape, dtype=np.float32), {**info, "immediate_reward": auto_reward}
+        if auto_reward != 0.0:
+            info = {**info, "immediate_reward": auto_reward}
+        return obs, info
 
-        return self._obs(), {"shoe_meta": self.shoe.to_meta(), "action_mask": self.action_masks()}
+    def _start_round(self) -> tuple[np.ndarray, Dict[str, Any], float, bool]:
+        auto_reward = 0.0
+        reshuffle_happened = False
+
+        while True:
+            self._deal_initial()
+            reshuffle_happened = reshuffle_happened or self._reshuffle_happened_this_round
+            self._log(
+                "initial_state",
+                player_initial=[c.to_dict() for c in self.hands[0].cards],
+                dealer_upcard=self.dealer_cards[0].to_dict(),
+                dealer_hole_card=self.dealer_cards[1].to_dict(),
+                shoe_meta=self.shoe.to_meta(),
+            )
+
+            if self.episode_mode == "shoe" and reshuffle_happened and self.rounds_in_episode > 0:
+                info = {
+                    "shoe_meta": self.shoe.to_meta(),
+                    "action_mask": np.array([True, False, False, False], dtype=bool),
+                    "reshuffle_happened": True,
+                    "rounds_in_episode": self.rounds_in_episode,
+                }
+                return np.zeros(self.observation_space.shape, dtype=np.float32), info, auto_reward, True
+
+            if self._dealer_peek_blackjack() or self.is_blackjack(self.hands[0].cards):
+                self.hands[0].done = True
+                self.current_hand_idx = 1
+                reward = self._resolve_round()
+                auto_reward += reward
+                self.rounds_in_episode += 1
+                self.last_round_revealed_cards = self._collect_revealed_cards()
+                round_reshuffle = self._reshuffle_happened_this_round
+                reshuffle_happened = reshuffle_happened or round_reshuffle
+                max_rounds_hit = self.episode_mode == "shoe" and self.rounds_in_episode >= self.max_rounds_per_episode
+                if self.episode_mode == "hand" or round_reshuffle or max_rounds_hit:
+                    info = {
+                        **self.last_info,
+                        "shoe_meta": self.shoe.to_meta(),
+                        "round_end": True,
+                        "round_reward": reward,
+                        "rounds_in_episode": self.rounds_in_episode,
+                        "reshuffle_happened": round_reshuffle,
+                        "action_mask": np.array([True, False, False, False], dtype=bool),
+                    }
+                    return np.zeros(self.observation_space.shape, dtype=np.float32), info, auto_reward, True
+                continue
+
+            info = {
+                "shoe_meta": self.shoe.to_meta(),
+                "action_mask": self.action_masks(),
+                "rounds_in_episode": self.rounds_in_episode,
+                "reshuffle_happened": reshuffle_happened,
+            }
+            return self._obs(), info, auto_reward, False
 
     def step(self, action: int):
         if self.terminated:
@@ -331,14 +422,51 @@ class BlackjackEnv(gym.Env):
 
         self._advance_hand()
         if self.current_hand_idx >= len(self.hands):
-            reward += self._resolve_round()
-            self.terminated = True
-            return np.zeros(self.observation_space.shape, dtype=np.float32), reward, True, False, {
-                **self.last_info,
-                "action_mask": np.array([True, False, False, False], dtype=bool),
+            round_reward = self._resolve_round()
+            reward += round_reward
+            self.rounds_in_episode += 1
+            self.last_round_revealed_cards = self._collect_revealed_cards()
+            reshuffle_happened = self._reshuffle_happened_this_round
+            max_rounds_hit = self.episode_mode == "shoe" and self.rounds_in_episode >= self.max_rounds_per_episode
+
+            if self.episode_mode == "hand" or reshuffle_happened or max_rounds_hit:
+                self.terminated = True
+                return np.zeros(self.observation_space.shape, dtype=np.float32), reward, True, False, {
+                    **self.last_info,
+                    "action_mask": np.array([True, False, False, False], dtype=bool),
+                    "round_end": True,
+                    "round_reward": round_reward,
+                    "rounds_in_episode": self.rounds_in_episode,
+                    "reshuffle_happened": reshuffle_happened,
+                }
+
+            next_obs, next_info, auto_reward, auto_terminated = self._start_round()
+            reward += auto_reward
+            if auto_terminated:
+                self.terminated = True
+                return np.zeros(self.observation_space.shape, dtype=np.float32), reward, True, False, {
+                    **next_info,
+                    "round_end": True,
+                    "round_reward": round_reward,
+                    "rounds_in_episode": self.rounds_in_episode,
+                    "reshuffle_happened": bool(next_info.get("reshuffle_happened", False) or reshuffle_happened),
+                    "action_mask": np.array([True, False, False, False], dtype=bool),
+                }
+
+            return next_obs, reward, False, False, {
+                **next_info,
+                "round_end": True,
+                "round_reward": round_reward,
+                "rounds_in_episode": self.rounds_in_episode,
+                "reshuffle_happened": bool(next_info.get("reshuffle_happened", False) or reshuffle_happened),
             }
 
-        info = {"action_mask": self.action_masks()}
+        info = {
+            "action_mask": self.action_masks(),
+            "shoe_meta": self.shoe.to_meta(),
+            "rounds_in_episode": self.rounds_in_episode,
+            "reshuffle_happened": self._reshuffle_happened_this_round,
+        }
         return self._obs(), reward, False, False, info
 
     def render(self, mode: str = "human"):

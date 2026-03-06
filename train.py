@@ -357,7 +357,8 @@ def main() -> None:
             pretrain_bet_mode=args.pretrain_bet_mode,
         )
         print(
-            f"Pretraining complete: samples={stats.samples}, epochs={stats.epochs}, final_loss={stats.final_loss:.4f}"
+            f"Pretraining complete: samples={stats.samples}, epochs={stats.epochs}, "
+            f"final_loss={stats.final_loss:.4f}, best_canonical_accuracy={100.0 * stats.best_canonical_accuracy:.2f}%"
         )
 
     eval_env_seed_base = args.seed + 100_000

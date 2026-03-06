@@ -84,10 +84,12 @@ class TrainingEvalCallback(BaseCallback):
         resolved_rounds = 0
         resolved_hands_total = 0
         total_reward = 0.0
+        total_wagered = 0.0
 
         def process_round_info(round_info):
-            nonlocal resolved_rounds, resolved_hands_total, wins, pushes, losses
+            nonlocal resolved_rounds, resolved_hands_total, wins, pushes, losses, total_wagered
             outcomes = round_info.get("outcomes") or getattr(eval_env, "last_info", {}).get("outcomes", [])
+            total_wagered += float(round_info.get("total_wagered", sum(outcome.get("bet", 0.0) for outcome in outcomes)))
             if not round_info.get("round_end", bool(outcomes)):
                 return
             resolved_rounds += 1
@@ -170,13 +172,15 @@ class TrainingEvalCallback(BaseCallback):
         denom_hands = max(1, resolved_hands_total)
         ev = total_reward / denom_rounds
         win_rate = wins / denom_hands
+        roi = total_reward / max(1e-9, total_wagered)
 
         print("------------------------------------------------")
         print("[TRAIN EVAL]")
         print(f"Step: {self.num_timesteps}")
         print(f"Rounds: {resolved_rounds}")
         print(f"Hands: {resolved_hands_total}")
-        print(f"EV: {ev:+.3f}")
+        print(f"EV per round: {ev:+.3f}")
+        print(f"ROI per unit wagered: {roi:+.3f}")
         print(f"Win rate: {win_rate * 100:.1f}%")
         print(f"Net units: {total_reward:+.0f}")
         print("------------------------------------------------")

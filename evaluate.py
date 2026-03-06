@@ -91,9 +91,13 @@ def main() -> None:
     parser.add_argument("--save-replays", type=int, default=50)
     parser.add_argument("--replay-out", type=str, default="./replays/eval_bundle.json")
     parser.add_argument("--algo", choices=["auto", "maskable", "ppo"], default="auto")
-    parser.add_argument("--obs-version", type=int, choices=[1, 2, 3], default=None)
+    parser.add_argument("--obs-version", type=int, choices=[1, 2, 3, 4], default=None)
     parser.add_argument("--episode-mode", choices=["hand", "shoe"], default="hand")
     parser.add_argument("--max-rounds-per-episode", type=int, default=200)
+    parser.add_argument("--enable-betting", action="store_true")
+    parser.add_argument("--bet-levels", type=str, default="1")
+    parser.add_argument("--bankroll-start", type=float, default=None)
+    parser.add_argument("--bankroll-stop-on-zero", action="store_true")
     progress_group = parser.add_mutually_exclusive_group()
     progress_group.add_argument("--progress", dest="progress", action="store_true")
     progress_group.add_argument("--no-progress", dest="progress", action="store_false")
@@ -101,6 +105,7 @@ def main() -> None:
     parser.set_defaults(progress=True)
     args = parser.parse_args()
 
+    bet_levels = [float(tok.strip()) for tok in args.bet_levels.split(",") if tok.strip()]
     model = None
     using_maskable = False
     if args.algo in {"auto", "maskable"}:
@@ -133,6 +138,10 @@ def main() -> None:
         obs_version=obs_version,
         episode_mode=args.episode_mode,
         max_rounds_per_episode=args.max_rounds_per_episode,
+        enable_betting=args.enable_betting,
+        bet_levels=bet_levels,
+        bankroll_start=args.bankroll_start,
+        bankroll_stop_on_zero=args.bankroll_stop_on_zero,
     )
 
     mask_warning_printed = False
@@ -159,14 +168,16 @@ def main() -> None:
     resolved_hands_total = 0
     wins = pushes = losses = blackjacks = 0
     interesting = []
+    total_wagered = 0.0
 
     def process_round_info(round_info: dict) -> bool:
-        nonlocal resolved_rounds, resolved_hands_total, wins, pushes, losses, blackjacks, interesting
+        nonlocal resolved_rounds, resolved_hands_total, wins, pushes, losses, blackjacks, interesting, total_wagered
         outcomes = round_info.get("outcomes")
         round_finished = round_info.get("round_end", bool(outcomes))
         if not round_finished:
             return False
         outcomes = outcomes or getattr(env, "last_info", {}).get("outcomes", [])
+        total_wagered += float(round_info.get("total_wagered", sum(out.get("bet", 0.0) for out in outcomes)))
         resolved_rounds += 1
         resolved_hands_total += len(outcomes)
         for out in outcomes:
@@ -269,6 +280,9 @@ def main() -> None:
     print(f"Resolved hands: {resolved_hands_total}")
     total_net = float(np.sum(episode_rewards))
     print(f"EV per round: {total_net / denom_rounds:.5f}")
+    denom_wagered = max(1e-9, total_wagered)
+    print(f"ROI per unit wagered: {total_net / denom_wagered:.5f}")
+    print(f"Total wagered (sum of resolved hand bets): {total_wagered:.2f}")
     print(f"Win rate (resolved hands): {wins / denom_hands:.5f}")
     print(f"Push rate (resolved hands): {pushes / denom_hands:.5f}")
     print(f"Loss rate (resolved hands): {losses / denom_hands:.5f}")

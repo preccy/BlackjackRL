@@ -219,6 +219,10 @@ class BlackjackEnv(gym.Env):
         remaining_hands: int = 0,
         is_first_decision: bool = True,
         phase_is_bet: bool = False,
+        *,
+        cum_bins: Optional[np.ndarray] = None,
+        cards_remaining_norm: Optional[float] = None,
+        rounds_since_shuffle_norm: Optional[float] = None,
     ) -> np.ndarray:
         total, usable = self.hand_value(player_cards)
         if phase_is_bet:
@@ -249,9 +253,18 @@ class BlackjackEnv(gym.Env):
             obs_vals.extend(self._last_round_rank_bins())
             obs_vals.append(self._cards_remaining_norm())
         elif self.obs_version == 4:
-            obs_vals.extend(self._cum_rank_bins_norm())
-            obs_vals.append(self._cards_remaining_norm())
-            obs_vals.append(min(1.0, self.rounds_since_shuffle / max(1, self.max_rounds_per_episode)))
+            if cum_bins is None:
+                obs_vals.extend(self._cum_rank_bins_norm())
+            else:
+                obs_vals.extend(np.asarray(cum_bins, dtype=np.float32).tolist())
+            if cards_remaining_norm is None:
+                obs_vals.append(self._cards_remaining_norm())
+            else:
+                obs_vals.append(float(cards_remaining_norm))
+            if rounds_since_shuffle_norm is None:
+                obs_vals.append(min(1.0, self.rounds_since_shuffle / max(1, self.max_rounds_per_episode)))
+            else:
+                obs_vals.append(float(rounds_since_shuffle_norm))
             obs_vals.append(float(phase_is_bet))
         obs = np.array(obs_vals, dtype=np.float32)
         return obs

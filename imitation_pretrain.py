@@ -94,7 +94,14 @@ def _append_sample(env: BlackjackEnv, cards: list[Card], dealer_rank: str, obs_o
     dealer = _card(dealer_rank, "♥")
     can_double = len(cards) == 2
     can_split = len(cards) == 2 and cards[0].rank_value == cards[1].rank_value
-    obs = env.obs_from_cards(cards, dealer, force_can_double=can_double, force_can_split=can_split)
+    obs = env.obs_from_cards(
+        cards,
+        dealer,
+        force_can_double=can_double,
+        force_can_split=can_split,
+        remaining_hands=0,
+        is_first_decision=(len(cards) == 2),
+    )
     action = oracle_action(cards, dealer_rank, can_double=can_double, can_split=can_split)
     obs_out.append(obs)
     actions_out.append(action)
@@ -114,18 +121,30 @@ def _append_sample_v4(
     dealer = _card(dealer_rank, "♥")
     can_double = len(cards) == 2
     can_split = len(cards) == 2 and cards[0].rank_value == cards[1].rank_value
+    is_first = len(cards) == 2
+    remaining_hands = rng.randint(0, 3) if can_split else 0
+
+    deck_size = float(max(1, 52 * env.n_decks))
+    cards_seen = rng.randint(0, 200)
+    raw_bins = np.zeros(10, dtype=np.float32)
+    for _ in range(cards_seen):
+        raw_bins[rng.randrange(10)] += 1.0
+    cum_bins = raw_bins / deck_size
+    cards_remaining_norm = max(0.05, min(1.0, 1.0 - (cards_seen / deck_size)))
+    rounds_since_shuffle_norm = rng.uniform(0.0, 1.0)
+
     obs = env.obs_from_cards(
         cards,
         dealer,
         force_can_double=can_double,
         force_can_split=can_split,
+        remaining_hands=remaining_hands,
+        is_first_decision=is_first,
         phase_is_bet=False,
+        cum_bins=cum_bins,
+        cards_remaining_norm=cards_remaining_norm,
+        rounds_since_shuffle_norm=rounds_since_shuffle_norm,
     )
-    # Randomize obs_version=4 counting features so play policy does not overfit to zero-count states.
-    obs[9:19] = np.asarray([rng.randint(0, 8) / (52.0 * max(1, env.n_decks)) for _ in range(10)], dtype=np.float32)
-    obs[19] = rng.uniform(0.1, 1.0)
-    obs[20] = rng.uniform(0.0, 1.0)
-    obs[21] = 0.0
 
     action = oracle_action(cards, dealer_rank, can_double=can_double, can_split=can_split)
     if action == 2 and not can_double:

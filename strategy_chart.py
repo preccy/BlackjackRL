@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable
 
 from stable_baselines3 import PPO
@@ -29,6 +31,32 @@ class LoadedModel:
 
 def _card(rank: str, suit: str = "♠") -> Card:
     return Card(rank=rank, suit=suit)
+
+
+def _meta_paths_for_model(model_path: str) -> list[Path]:
+    p = Path(model_path)
+    candidates = []
+    if p.suffix:
+        candidates.append(p.with_suffix(p.suffix + ".meta.json"))
+        candidates.append(p.with_suffix(".meta.json"))
+    else:
+        candidates.append(Path(f"{model_path}.meta.json"))
+    return candidates
+
+
+def _resolve_obs_version(model_path: str, obs_version_arg: int | None) -> int:
+    if obs_version_arg is not None:
+        return obs_version_arg
+    for meta_path in _meta_paths_for_model(model_path):
+        if not meta_path.exists():
+            continue
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            return int(meta.get("env", {}).get("obs_version", 1))
+        except Exception as exc:
+            print(f"Warning: could not parse metadata {meta_path} ({exc!r}); defaulting to obs_version=1")
+            break
+    return 1
 
 
 def load_model(model_path: str, algo: str) -> LoadedModel:
@@ -129,12 +157,15 @@ def main() -> None:
         default="auto",
         help="Model algorithm type (maskable supports MaskablePPO, recurrent for MaskableRecurrentPPO).",
     )
+    parser.add_argument("--obs-version", type=int, choices=[1, 2], default=None)
     args = parser.parse_args()
 
     model_info = load_model(args.model, args.algo)
+    obs_version = _resolve_obs_version(args.model, args.obs_version)
     print(f"Loaded model with {model_info.algo_name}")
+    print(f"Using obs_version={obs_version}")
 
-    env = BlackjackEnv(seed=0, n_decks=1, penetration=0.0)
+    env = BlackjackEnv(seed=0, n_decks=1, penetration=0.0, obs_version=obs_version)
 
     hard_rows = [(str(total), hard_total_cards(total)) for total in range(8, 21)]
     soft_rows = [(f"A{k}", soft_hand_cards(k)) for k in range(2, 10)]

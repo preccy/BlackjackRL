@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import time
 from pathlib import Path
 
@@ -18,6 +19,34 @@ def pick_interesting(info: dict) -> bool:
         key in labels
         for key in ["win_blackjack", "push_blackjack", "loss_dealer_blackjack", "win_dealer_bust"]
     ) or len(outcomes) > 1 or any(abs(o["reward"]) >= 2 for o in outcomes)
+
+
+def _meta_paths_for_model(model_path: str) -> list[Path]:
+    p = Path(model_path)
+    candidates = []
+    if p.suffix:
+        candidates.append(p.with_suffix(p.suffix + ".meta.json"))
+        candidates.append(p.with_suffix(".meta.json"))
+    else:
+        candidates.append(Path(f"{model_path}.meta.json"))
+    return candidates
+
+
+def _resolve_obs_version(model_path: str, obs_version_arg: int | None) -> int:
+    if obs_version_arg is not None:
+        return obs_version_arg
+    for meta_path in _meta_paths_for_model(model_path):
+        if not meta_path.exists():
+            continue
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            obs_version = int(meta.get("env", {}).get("obs_version", 1))
+            print(f"Using obs_version={obs_version} from {meta_path}")
+            return obs_version
+        except Exception as exc:
+            print(f"Warning: could not parse metadata {meta_path} ({exc!r}); defaulting to obs_version=1")
+            break
+    return 1
 
 
 def get_action_mask(env: BlackjackEnv):
@@ -53,6 +82,7 @@ def main() -> None:
     parser.add_argument("--save-replays", type=int, default=50)
     parser.add_argument("--replay-out", type=str, default="./replays/eval_bundle.json")
     parser.add_argument("--algo", choices=["auto", "maskable", "ppo"], default="auto")
+    parser.add_argument("--obs-version", type=int, choices=[1, 2], default=None)
     progress_group = parser.add_mutually_exclusive_group()
     progress_group.add_argument("--progress", dest="progress", action="store_true")
     progress_group.add_argument("--no-progress", dest="progress", action="store_false")
@@ -75,7 +105,8 @@ def main() -> None:
     if model is None:
         model = PPO.load(args.model)
 
-    env = BlackjackEnv(record_events=True)
+    obs_version = _resolve_obs_version(args.model, args.obs_version)
+    env = BlackjackEnv(record_events=True, obs_version=obs_version)
 
     mask_warning_printed = False
     mask_aware_predict = using_maskable or args.algo == "maskable"
@@ -102,6 +133,18 @@ def main() -> None:
         done = False
         ep_reward = 0.0
         final_info = info
+
+        if env.terminated or "immediate_reward" in info:
+            mask = get_action_mask(env)
+            dummy_action = 0
+            if using_maskable and mask is not None:
+                action, _ = model.predict(obs, deterministic=True, action_masks=mask)
+                dummy_action = int(action)
+            obs, r, term, trunc, info = env.step(dummy_action)
+            ep_reward += r
+            done = term or trunc
+            final_info = info
+
         while not done:
             if using_maskable:
                 mask = get_action_mask(env)

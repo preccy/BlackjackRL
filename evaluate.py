@@ -82,7 +82,9 @@ def main() -> None:
     parser.add_argument("--save-replays", type=int, default=50)
     parser.add_argument("--replay-out", type=str, default="./replays/eval_bundle.json")
     parser.add_argument("--algo", choices=["auto", "maskable", "ppo"], default="auto")
-    parser.add_argument("--obs-version", type=int, choices=[1, 2], default=None)
+    parser.add_argument("--obs-version", type=int, choices=[1, 2, 3], default=None)
+    parser.add_argument("--episode-mode", choices=["hand", "shoe"], default="hand")
+    parser.add_argument("--max-rounds-per-episode", type=int, default=200)
     progress_group = parser.add_mutually_exclusive_group()
     progress_group.add_argument("--progress", dest="progress", action="store_true")
     progress_group.add_argument("--no-progress", dest="progress", action="store_false")
@@ -106,7 +108,12 @@ def main() -> None:
         model = PPO.load(args.model)
 
     obs_version = _resolve_obs_version(args.model, args.obs_version)
-    env = BlackjackEnv(record_events=True, obs_version=obs_version)
+    env = BlackjackEnv(
+        record_events=True,
+        obs_version=obs_version,
+        episode_mode=args.episode_mode,
+        max_rounds_per_episode=args.max_rounds_per_episode,
+    )
 
     mask_warning_printed = False
     mask_aware_predict = using_maskable or args.algo == "maskable"
@@ -128,11 +135,15 @@ def main() -> None:
     wins = pushes = losses = blackjacks = 0
     interesting = []
 
-    for ep in range(args.hands):
-        obs, info = env.reset(seed=ep)
-        done = False
-        ep_reward = 0.0
-        final_info = info
+    obs = None
+    info = {}
+    reset_seed = 0
+    while resolved_hands < args.hands:
+        if obs is None:
+            obs, info = env.reset(seed=reset_seed)
+            reset_seed += 1
+            episode_count += 1
+            episode_rewards.append(0.0)
 
         if env.terminated or "immediate_reward" in info:
             mask = get_action_mask(env)
@@ -141,56 +152,72 @@ def main() -> None:
                 action, _ = model.predict(obs, deterministic=True, action_masks=mask)
                 dummy_action = int(action)
             obs, r, term, trunc, info = env.step(dummy_action)
-            ep_reward += r
-            done = term or trunc
-            final_info = info
+            episode_rewards[-1] += r
+            if term or trunc:
+                final_info = info
+                outcomes = final_info.get("outcomes", [])
+                round_finished = final_info.get("round_end", bool(outcomes))
+                if round_finished:
+                    resolved_hands += 1
+                    for out in outcomes:
+                        if out["reward"] > 0:
+                            wins += 1
+                        elif out["reward"] == 0:
+                            pushes += 1
+                        else:
+                            losses += 1
+                        if out["outcome"] in {"win_blackjack", "push_blackjack"}:
+                            blackjacks += 1
+                    if len(interesting) < args.save_replays and pick_interesting(final_info):
+                        interesting.append(env.export_episode())
+                obs = None
+            continue
 
-        while not done:
-            if using_maskable:
-                mask = get_action_mask(env)
-                if mask is None and not mask_warning_printed:
-                    print("Warning: action masks unavailable during evaluation; continuing without masks.")
-                    mask_warning_printed = True
-                if mask is not None:
-                    action, _ = model.predict(obs, deterministic=True, action_masks=mask)
-                else:
-                    action, _ = model.predict(obs, deterministic=True)
+        if using_maskable:
+            mask = get_action_mask(env)
+            if mask is None and not mask_warning_printed:
+                print("Warning: action masks unavailable during evaluation; continuing without masks.")
+                mask_warning_printed = True
+            if mask is not None:
+                action, _ = model.predict(obs, deterministic=True, action_masks=mask)
             else:
                 action, _ = model.predict(obs, deterministic=True)
+        else:
+            action, _ = model.predict(obs, deterministic=True)
 
-            obs, r, term, trunc, info = env.step(int(action))
-            ep_reward += r
-            done = term or trunc
-            final_info = info
+        obs, r, term, trunc, info = env.step(int(action))
+        episode_rewards[-1] += r
 
-        episode_count += 1
-        episode_rewards.append(ep_reward)
-        outcomes = final_info.get("outcomes", [])
-        resolved_hands += len(outcomes)
-        for out in outcomes:
-            if out["reward"] > 0:
-                wins += 1
-            elif out["reward"] == 0:
-                pushes += 1
-            else:
-                losses += 1
-            if out["outcome"] in {"win_blackjack", "push_blackjack"}:
-                blackjacks += 1
+        outcomes = info.get("outcomes", [])
+        round_finished = info.get("round_end", bool(outcomes))
+        if round_finished:
+            resolved_hands += 1
+            for out in outcomes:
+                if out["reward"] > 0:
+                    wins += 1
+                elif out["reward"] == 0:
+                    pushes += 1
+                else:
+                    losses += 1
+                if out["outcome"] in {"win_blackjack", "push_blackjack"}:
+                    blackjacks += 1
+            if len(interesting) < args.save_replays and pick_interesting(info):
+                interesting.append(env.export_episode())
 
-        if len(interesting) < args.save_replays and pick_interesting(final_info):
-            interesting.append(env.export_episode())
+        if term or trunc:
+            obs = None
 
-        if progress is not None:
+        if progress is not None and round_finished:
             progress.update(1)
-            if (ep + 1) % max(1, args.progress_update_every) == 0 or (ep + 1) == args.hands:
+            if resolved_hands % max(1, args.progress_update_every) == 0 or resolved_hands >= args.hands:
                 elapsed = max(1e-9, time.perf_counter() - start)
                 denom_hands = max(1, resolved_hands)
                 progress.set_postfix(
                     resolved=resolved_hands,
-                    ev=f"{np.mean(episode_rewards):.4f}",
+                    ev=f"{(np.sum(episode_rewards) / denom_hands):.4f}",
                     win_rate=f"{wins / denom_hands:.3f}",
                     net=f"{np.sum(episode_rewards):.1f}",
-                    hps=f"{episode_count / elapsed:.1f}",
+                    hps=f"{resolved_hands / elapsed:.1f}",
                 )
 
     if progress is not None:
@@ -199,7 +226,8 @@ def main() -> None:
     denom_hands = max(1, resolved_hands)
     print(f"Episodes played: {episode_count}")
     print(f"Resolved hands: {resolved_hands}")
-    print(f"EV per round (episode): {np.mean(episode_rewards):.5f}")
+    total_net = float(np.sum(episode_rewards))
+    print(f"EV per round: {total_net / denom_hands:.5f}")
     print(f"Win rate (resolved hands): {wins / denom_hands:.5f}")
     print(f"Push rate (resolved hands): {pushes / denom_hands:.5f}")
     print(f"Loss rate (resolved hands): {losses / denom_hands:.5f}")

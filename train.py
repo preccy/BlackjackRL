@@ -60,9 +60,14 @@ def mask_fn(env):
     )
 
 
-def make_env(rank: int, base_seed: int, obs_version: int):
+def make_env(rank: int, base_seed: int, obs_version: int, episode_mode: str, max_rounds_per_episode: int):
     def _init():
-        env = BlackjackEnv(seed=base_seed + rank, obs_version=obs_version)
+        env = BlackjackEnv(
+            seed=base_seed + rank,
+            obs_version=obs_version,
+            episode_mode=episode_mode,
+            max_rounds_per_episode=max_rounds_per_episode,
+        )
         if ActionMasker is not None:
             env = ActionMasker(env, mask_fn)
         return Monitor(env)
@@ -139,7 +144,7 @@ def resolve_device(requested: str) -> str:
     return requested
 
 
-def _save_meta(model_out: str, obs_version: int) -> None:
+def _save_meta(model_out: str, obs_version: int, episode_mode: str, max_rounds_per_episode: int) -> None:
     model_path = Path(model_out)
     meta_path = model_path.with_suffix(model_path.suffix + ".meta.json") if model_path.suffix else Path(f"{model_out}.meta.json")
     meta = {
@@ -152,6 +157,8 @@ def _save_meta(model_out: str, obs_version: int) -> None:
             "max_hands": 4,
             "illegal_action_penalty": -0.05,
             "obs_version": obs_version,
+            "episode_mode": episode_mode,
+            "max_rounds_per_episode": max_rounds_per_episode,
         }
     }
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
@@ -175,7 +182,9 @@ def main() -> None:
     parser.add_argument("--model-in", type=str, default=None, help="Optional checkpoint to continue training from.")
     parser.add_argument("--train-eval-freq", type=int, default=100_000)
     parser.add_argument("--train-eval-hands", type=int, default=20_000)
-    parser.add_argument("--obs-version", type=int, choices=[1, 2], default=1)
+    parser.add_argument("--obs-version", type=int, choices=[1, 2, 3], default=1)
+    parser.add_argument("--episode-mode", choices=["hand", "shoe"], default="hand")
+    parser.add_argument("--max-rounds-per-episode", type=int, default=200)
     parser.add_argument("--pretrain-basic-strategy", action="store_true")
     parser.add_argument("--pretrain-epochs", type=int, default=5)
     parser.add_argument("--pretrain-samples", type=int, default=200_000)
@@ -229,7 +238,10 @@ def main() -> None:
     elif not maskable_available:
         use_maskable = False
 
-    env_fns = [make_env(rank, args.seed, args.obs_version) for rank in range(args.n_envs)]
+    env_fns = [
+        make_env(rank, args.seed, args.obs_version, args.episode_mode, args.max_rounds_per_episode)
+        for rank in range(args.n_envs)
+    ]
     env, actual_vec_env = build_vec_env(args.n_envs, env_fns, args.vec_env)
     algo_cls = MaskablePPO if use_maskable else PPO
     masking_enabled = use_maskable
@@ -239,6 +251,7 @@ def main() -> None:
     print(f"Algorithm: {algo_cls.__name__}")
     print(f"Masking enabled: {masking_enabled}")
     print(f"Observation version: {args.obs_version}")
+    print(f"Episode mode: {args.episode_mode} (max_rounds_per_episode={args.max_rounds_per_episode})")
     print(f"Vector env setup: base_seed={args.seed}, n_envs={args.n_envs}, vec_env={actual_vec_env}")
     print(f"torch num threads: {torch.get_num_threads()}")
     print(f"torch interop threads: {torch.get_num_interop_threads()}")
@@ -275,7 +288,7 @@ def main() -> None:
         model = algo_cls(**model_kwargs)
 
     if args.pretrain_basic_strategy:
-        pretrain_env = BlackjackEnv(seed=args.seed, obs_version=2)
+        pretrain_env = BlackjackEnv(seed=args.seed, obs_version=2, episode_mode="hand")
         stats = run_basic_strategy_pretrain(
             model,
             pretrain_env,
@@ -290,7 +303,13 @@ def main() -> None:
     eval_env_seed_base = args.seed + 100_000
 
     def make_eval_env():
-        return BlackjackEnv(seed=eval_env_seed_base, record_events=False, obs_version=args.obs_version)
+        return BlackjackEnv(
+            seed=eval_env_seed_base,
+            record_events=False,
+            obs_version=args.obs_version,
+            episode_mode=args.episode_mode,
+            max_rounds_per_episode=args.max_rounds_per_episode,
+        )
 
     callback = TrainingEvalCallback(
         eval_env_fn=make_eval_env,
@@ -313,7 +332,12 @@ def main() -> None:
     elapsed = max(1e-9, time.perf_counter() - start)
     Path(args.model_out).parent.mkdir(parents=True, exist_ok=True)
     model.save(args.model_out)
-    _save_meta(args.model_out, obs_version=args.obs_version)
+    _save_meta(
+        args.model_out,
+        obs_version=args.obs_version,
+        episode_mode=args.episode_mode,
+        max_rounds_per_episode=args.max_rounds_per_episode,
+    )
     print(f"Saved model to {args.model_out}.zip")
     print(f"Total timesteps seen: {model.num_timesteps}")
     print(f"Elapsed wall time: {elapsed:.2f}s")

@@ -74,10 +74,13 @@ class TrainingEvalCallback(BaseCallback):
         total_reward = 0.0
 
         try:
-            for hand_idx in range(self.n_eval_hands):
-                obs, info = eval_env.reset(seed=hand_idx)
-                done = False
-                final_info = info
+            obs = None
+            info = {}
+            reset_seed = 0
+            while resolved_hands < self.n_eval_hands:
+                if obs is None:
+                    obs, info = eval_env.reset(seed=reset_seed)
+                    reset_seed += 1
 
                 if getattr(eval_env, "terminated", False) or "immediate_reward" in info:
                     mask = self._get_action_mask(eval_env)
@@ -87,42 +90,54 @@ class TrainingEvalCallback(BaseCallback):
                         dummy_action = int(action)
                     obs, reward, terminated, truncated, info = eval_env.step(dummy_action)
                     total_reward += reward
-                    done = terminated or truncated
-                    final_info = info
+                    if terminated or truncated:
+                        outcomes = info.get("outcomes", [])
+                        if info.get("round_end", bool(outcomes)):
+                            resolved_hands += 1
+                            for outcome in outcomes:
+                                r = outcome.get("reward", 0)
+                                if r > 0:
+                                    wins += 1
+                                elif r == 0:
+                                    pushes += 1
+                                else:
+                                    losses += 1
+                        obs = None
+                    continue
 
-                while not done:
-                    if using_maskable:
-                        mask = self._get_action_mask(eval_env)
-                        if mask is None and not self._mask_warning_printed:
-                            print("[TRAIN EVAL] Warning: action masks unavailable; continuing without masks.")
-                            self._mask_warning_printed = True
+                if using_maskable:
+                    mask = self._get_action_mask(eval_env)
+                    if mask is None and not self._mask_warning_printed:
+                        print("[TRAIN EVAL] Warning: action masks unavailable; continuing without masks.")
+                        self._mask_warning_printed = True
 
-                        if mask is not None:
-                            action, _ = self.model.predict(
-                                obs,
-                                deterministic=self.deterministic,
-                                action_masks=mask,
-                            )
-                        else:
-                            action, _ = self.model.predict(obs, deterministic=self.deterministic)
+                    if mask is not None:
+                        action, _ = self.model.predict(
+                            obs,
+                            deterministic=self.deterministic,
+                            action_masks=mask,
+                        )
                     else:
                         action, _ = self.model.predict(obs, deterministic=self.deterministic)
+                else:
+                    action, _ = self.model.predict(obs, deterministic=self.deterministic)
 
-                    obs, reward, terminated, truncated, info = eval_env.step(int(action))
-                    total_reward += reward
-                    done = terminated or truncated
-                    final_info = info
+                obs, reward, terminated, truncated, info = eval_env.step(int(action))
+                total_reward += reward
+                outcomes = info.get("outcomes", [])
+                if info.get("round_end", bool(outcomes)):
+                    resolved_hands += 1
+                    for outcome in outcomes:
+                        r = outcome.get("reward", 0)
+                        if r > 0:
+                            wins += 1
+                        elif r == 0:
+                            pushes += 1
+                        else:
+                            losses += 1
 
-                outcomes = final_info.get("outcomes", [])
-                resolved_hands += len(outcomes)
-                for outcome in outcomes:
-                    r = outcome.get("reward", 0)
-                    if r > 0:
-                        wins += 1
-                    elif r == 0:
-                        pushes += 1
-                    else:
-                        losses += 1
+                if terminated or truncated:
+                    obs = None
         finally:
             eval_env.close()
 

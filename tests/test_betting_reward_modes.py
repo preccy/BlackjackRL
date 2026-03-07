@@ -17,7 +17,21 @@ def test_betting_reward_modes_calculation_helpers():
 
     env.betting_reward_mode = "log_bankroll"
     got = env._round_reward_from_mode(4.0, 8.0, 200.0, 204.0)
-    assert math.isclose(got, math.log(204.0 + 1e-8) - math.log(200.0 + 1e-8), rel_tol=1e-9)
+    assert math.isclose(got, math.log(204.0 + 1e-6) - math.log(200.0 + 1e-6), rel_tol=1e-9)
+
+
+def test_log_bankroll_requires_round_bankroll_values():
+    env = BlackjackEnv(enable_betting=True, bet_levels=[1, 2, 4], bankroll_start=200, betting_reward_mode="log_bankroll")
+    try:
+        env._round_reward_from_mode(4.0, 8.0, None, 204.0)
+        assert False, "Expected ValueError when bankroll_before_round is missing"
+    except ValueError:
+        pass
+
+
+def test_bankroll_bust_defaults_to_enabled_when_bankroll_tracking_on():
+    env = BlackjackEnv(enable_betting=True, bet_levels=[1, 2], bankroll_start=10.0)
+    assert env.terminate_on_bankroll_bust is True
 
 
 def test_bet_entropy_bonus_scaled_by_bet_index():

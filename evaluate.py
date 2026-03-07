@@ -99,12 +99,16 @@ def main() -> None:
     parser.add_argument("--bet-levels", type=str, default="1")
     parser.add_argument("--bankroll-start", type=float, default=None)
     parser.add_argument("--bankroll-stop-on-zero", action="store_true")
+    parser.add_argument("--terminate-on-bankroll-bust", dest="terminate_on_bankroll_bust", action="store_true")
+    parser.add_argument("--no-terminate-on-bankroll-bust", dest="terminate_on_bankroll_bust", action="store_false")
     progress_group = parser.add_mutually_exclusive_group()
     progress_group.add_argument("--progress", dest="progress", action="store_true")
     progress_group.add_argument("--no-progress", dest="progress", action="store_false")
     parser.add_argument("--progress-update-every", type=int, default=250)
-    parser.set_defaults(progress=True)
+    parser.set_defaults(progress=True, terminate_on_bankroll_bust=None)
     args = parser.parse_args()
+    if args.terminate_on_bankroll_bust is None:
+        args.terminate_on_bankroll_bust = args.bankroll_start is not None
 
     bet_levels = [float(tok.strip()) for tok in args.bet_levels.split(",") if tok.strip()]
     model = None
@@ -143,6 +147,7 @@ def main() -> None:
         bet_levels=bet_levels,
         bankroll_start=args.bankroll_start,
         bankroll_stop_on_zero=args.bankroll_stop_on_zero,
+        terminate_on_bankroll_bust=args.terminate_on_bankroll_bust,
     )
 
     mask_warning_printed = False
@@ -174,9 +179,14 @@ def main() -> None:
     bet_level_profit: Counter[float] = Counter()
     bet_level_wagered: Counter[float] = Counter()
     bet_level_rounds: Counter[float] = Counter()
+    bankroll_start_value = float(args.bankroll_start) if args.bankroll_start is not None else None
+    bankroll_first = None
+    bankroll_last = None
+    bankroll_max = None
+    bankroll_min = None
 
     def process_round_info(round_info: dict) -> bool:
-        nonlocal resolved_rounds, resolved_hands_total, wins, pushes, losses, blackjacks, interesting, total_wagered, bet_counter, bet_level_profit, bet_level_wagered, bet_level_rounds
+        nonlocal resolved_rounds, resolved_hands_total, wins, pushes, losses, blackjacks, interesting, total_wagered, bet_counter, bet_level_profit, bet_level_wagered, bet_level_rounds, bankroll_first, bankroll_last, bankroll_max, bankroll_min
         outcomes = round_info.get("outcomes")
         round_finished = round_info.get("round_end", bool(outcomes))
         if not round_finished:
@@ -184,6 +194,18 @@ def main() -> None:
         outcomes = outcomes or getattr(env, "last_info", {}).get("outcomes", [])
         round_wagered = float(round_info.get("total_wagered_this_round", round_info.get("total_wagered", sum(out.get("bet", 0.0) for out in outcomes))))
         total_wagered += round_wagered
+        bankroll_before_round = round_info.get("bankroll_before_round")
+        bankroll_after_round = round_info.get("bankroll_after_round")
+        if bankroll_before_round is not None and bankroll_first is None:
+            bankroll_first = float(bankroll_before_round)
+        if bankroll_after_round is not None:
+            bankroll_last = float(bankroll_after_round)
+            if bankroll_max is None:
+                bankroll_max = bankroll_last
+                bankroll_min = bankroll_last
+            else:
+                bankroll_max = max(bankroll_max, bankroll_last)
+                bankroll_min = min(bankroll_min, bankroll_last)
         if args.enable_betting:
             try:
                 bet_level = float(round_info.get("current_bet", env.current_bet))
@@ -319,6 +341,18 @@ def main() -> None:
             print(
                 f"  {lvl:.1f}: rounds={rounds}, avg_profit={avg_profit:+.5f}, roi={lvl_roi:+.5f}"
             )
+
+    if args.bankroll_start is not None:
+        start_bankroll = bankroll_first if bankroll_first is not None else bankroll_start_value
+        end_bankroll = bankroll_last if bankroll_last is not None else float(env.bankroll_current)
+        max_bankroll = bankroll_max if bankroll_max is not None else end_bankroll
+        min_bankroll = bankroll_min if bankroll_min is not None else end_bankroll
+        avg_change_per_round = (end_bankroll - start_bankroll) / denom_rounds
+        print(f"bankroll_start: {start_bankroll:.5f}")
+        print(f"bankroll_end: {end_bankroll:.5f}")
+        print(f"average bankroll change per round: {avg_change_per_round:.5f}")
+        print(f"max bankroll observed: {max_bankroll:.5f}")
+        print(f"min bankroll observed: {min_bankroll:.5f}")
 
     if interesting:
         Path(args.replay_out).parent.mkdir(parents=True, exist_ok=True)

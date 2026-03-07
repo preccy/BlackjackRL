@@ -48,6 +48,7 @@ class BlackjackEnv(gym.Env):
         bet_levels: Optional[List[float]] = None,
         bankroll_start: Optional[float] = None,
         bankroll_stop_on_zero: bool = False,
+        terminate_on_bankroll_bust: Optional[bool] = None,
         betting_reward_mode: str = "net",
         bet_entropy_bonus: float = 0.0,
     ):
@@ -78,9 +79,13 @@ class BlackjackEnv(gym.Env):
         self.bankroll_start = bankroll_start
         self.bankroll_current = float(bankroll_start) if bankroll_start is not None else 0.0
         self.bankroll_stop_on_zero = bool(bankroll_stop_on_zero)
+        if terminate_on_bankroll_bust is None:
+            self.terminate_on_bankroll_bust = bankroll_start is not None
+        else:
+            self.terminate_on_bankroll_bust = bool(terminate_on_bankroll_bust)
         if betting_reward_mode not in {"net", "roi", "log_bankroll"}:
             raise ValueError("betting_reward_mode must be one of: net, roi, log_bankroll")
-        if self.enable_betting and betting_reward_mode == "log_bankroll" and bankroll_start is None:
+        if betting_reward_mode == "log_bankroll" and bankroll_start is None:
             raise ValueError("betting_reward_mode='log_bankroll' requires bankroll_start to be set")
         self.betting_reward_mode = betting_reward_mode
         self.bet_entropy_bonus = float(bet_entropy_bonus)
@@ -402,9 +407,19 @@ class BlackjackEnv(gym.Env):
             return round_profit / max(1e-8, total_wagered_this_round)
 
         if bankroll_before_round is None or bankroll_after_round is None:
-            return round_profit
-        eps = 1e-8
+            raise ValueError(
+                "betting_reward_mode='log_bankroll' requires bankroll tracking data for the round; "
+                "set bankroll_start and ensure bankroll values are recorded."
+            )
+        eps = 1e-6
         return math.log(bankroll_after_round + eps) - math.log(bankroll_before_round + eps)
+
+    def _is_bankroll_bust(self) -> bool:
+        if self.bankroll_start is None:
+            return False
+        if not (self.terminate_on_bankroll_bust or self.bankroll_stop_on_zero):
+            return False
+        return self.bankroll_current <= 0
 
     def _bet_exploration_bonus(self) -> float:
         if not self.enable_betting or self.bet_entropy_bonus == 0.0:
@@ -513,6 +528,7 @@ class BlackjackEnv(gym.Env):
         payload["round_reward"] = round_reward_signal + bet_bonus
         if self.bankroll_start is not None:
             payload["bankroll_current"] = float(self.bankroll_current)
+            payload["bankroll_bust"] = self._is_bankroll_bust()
         return payload
 
     def _start_round(self) -> tuple[np.ndarray, Dict[str, Any], float, bool]:
@@ -561,9 +577,9 @@ class BlackjackEnv(gym.Env):
                 reshuffle_happened = reshuffle_happened or round_reshuffle
                 round_payload = self._finalize_round(round_reward, round_reshuffle)
                 max_rounds_hit = self.episode_mode == "shoe" and self.rounds_in_episode >= self.max_rounds_per_episode
-                bankroll_bust = self.bankroll_start is not None and self.bankroll_stop_on_zero and self.bankroll_current <= 0
+                bankroll_bust = self._is_bankroll_bust()
                 if self.episode_mode == "hand" or round_reshuffle or max_rounds_hit or bankroll_bust:
-                    info = {**round_payload, "action_mask": self._terminated_action_mask()}
+                    info = {**round_payload, "action_mask": self._terminated_action_mask(), "bankroll_bust": bankroll_bust}
                     return np.zeros(self.observation_space.shape, dtype=np.float32), info, auto_reward, True
 
                 next_obs, next_info, next_auto_reward, next_terminated = self._start_round()
@@ -638,7 +654,7 @@ class BlackjackEnv(gym.Env):
                 round_payload = self._finalize_round(round_reward, round_reshuffle)
                 reward += float(round_payload["round_reward"])
                 max_rounds_hit = self.episode_mode == "shoe" and self.rounds_in_episode >= self.max_rounds_per_episode
-                bankroll_bust = self.bankroll_start is not None and self.bankroll_stop_on_zero and self.bankroll_current <= 0
+                bankroll_bust = self._is_bankroll_bust()
 
                 if self.episode_mode == "hand" or round_reshuffle or max_rounds_hit or bankroll_bust:
                     self.terminated = True
@@ -646,6 +662,7 @@ class BlackjackEnv(gym.Env):
                         **round_payload,
                         "action_mask": self._terminated_action_mask(),
                         "phase": "TERMINATED",
+                        "bankroll_bust": bankroll_bust,
                     }
 
                 next_obs, next_info, next_auto_reward, next_terminated = self._start_round()
@@ -723,13 +740,14 @@ class BlackjackEnv(gym.Env):
             round_payload = self._finalize_round(round_reward, reshuffle_happened)
             reward += float(round_payload["round_reward"])
             max_rounds_hit = self.episode_mode == "shoe" and self.rounds_in_episode >= self.max_rounds_per_episode
-            bankroll_bust = self.bankroll_start is not None and self.bankroll_stop_on_zero and self.bankroll_current <= 0
+            bankroll_bust = self._is_bankroll_bust()
 
             if self.episode_mode == "hand" or reshuffle_happened or max_rounds_hit or bankroll_bust:
                 self.terminated = True
                 return np.zeros(self.observation_space.shape, dtype=np.float32), reward, True, False, {
                     **round_payload,
                     "action_mask": self._terminated_action_mask(),
+                    "bankroll_bust": bankroll_bust,
                 }
 
             next_obs, next_info, auto_reward, auto_terminated = self._start_round()

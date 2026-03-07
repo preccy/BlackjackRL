@@ -60,7 +60,7 @@ def mask_fn(env):
     )
 
 
-def make_env(rank: int, base_seed: int, obs_version: int, episode_mode: str, max_rounds_per_episode: int, enable_betting: bool, bet_levels: list[float], bankroll_start: float | None, bankroll_stop_on_zero: bool, betting_reward_mode: str, bet_entropy_bonus: float):
+def make_env(rank: int, base_seed: int, obs_version: int, episode_mode: str, max_rounds_per_episode: int, enable_betting: bool, bet_levels: list[float], bankroll_start: float | None, bankroll_stop_on_zero: bool, terminate_on_bankroll_bust: bool, betting_reward_mode: str, bet_entropy_bonus: float):
     def _init():
         env = BlackjackEnv(
             seed=base_seed + rank,
@@ -71,6 +71,7 @@ def make_env(rank: int, base_seed: int, obs_version: int, episode_mode: str, max
             bet_levels=bet_levels,
             bankroll_start=bankroll_start,
             bankroll_stop_on_zero=bankroll_stop_on_zero,
+            terminate_on_bankroll_bust=terminate_on_bankroll_bust,
             betting_reward_mode=betting_reward_mode,
             bet_entropy_bonus=bet_entropy_bonus,
         )
@@ -150,7 +151,7 @@ def resolve_device(requested: str) -> str:
     return requested
 
 
-def _save_meta(model_out: str, obs_version: int, episode_mode: str, max_rounds_per_episode: int, enable_betting: bool, bet_levels: list[float], bankroll_start: float | None, bankroll_stop_on_zero: bool, betting_reward_mode: str, bet_entropy_bonus: float) -> None:
+def _save_meta(model_out: str, obs_version: int, episode_mode: str, max_rounds_per_episode: int, enable_betting: bool, bet_levels: list[float], bankroll_start: float | None, bankroll_stop_on_zero: bool, terminate_on_bankroll_bust: bool, betting_reward_mode: str, bet_entropy_bonus: float) -> None:
     model_path = Path(model_out)
     meta_path = model_path.with_suffix(model_path.suffix + ".meta.json") if model_path.suffix else Path(f"{model_out}.meta.json")
     meta = {
@@ -169,6 +170,7 @@ def _save_meta(model_out: str, obs_version: int, episode_mode: str, max_rounds_p
             "bet_levels": bet_levels,
             "bankroll_start": bankroll_start,
             "bankroll_stop_on_zero": bankroll_stop_on_zero,
+            "terminate_on_bankroll_bust": terminate_on_bankroll_bust,
             "betting_reward_mode": betting_reward_mode,
             "bet_entropy_bonus": bet_entropy_bonus,
         }
@@ -201,6 +203,8 @@ def main() -> None:
     parser.add_argument("--bet-levels", type=str, default="1")
     parser.add_argument("--bankroll-start", type=float, default=None)
     parser.add_argument("--bankroll-stop-on-zero", action="store_true")
+    parser.add_argument("--terminate-on-bankroll-bust", dest="terminate_on_bankroll_bust", action="store_true")
+    parser.add_argument("--no-terminate-on-bankroll-bust", dest="terminate_on_bankroll_bust", action="store_false")
     parser.add_argument("--betting-reward-mode", choices=["net", "roi", "log_bankroll"], default="net")
     parser.add_argument("--bet-entropy-bonus", type=float, default=0.0)
     parser.add_argument("--pretrain-basic-strategy", action="store_true")
@@ -225,8 +229,11 @@ def main() -> None:
     progress_group = parser.add_mutually_exclusive_group()
     progress_group.add_argument("--progress", dest="progress", action="store_true")
     progress_group.add_argument("--no-progress", dest="progress", action="store_false")
-    parser.set_defaults(progress=True)
+    parser.set_defaults(progress=True, terminate_on_bankroll_bust=None)
     args = parser.parse_args()
+
+    if args.terminate_on_bankroll_bust is None:
+        args.terminate_on_bankroll_bust = args.bankroll_start is not None
 
     bet_levels = parse_bet_levels(args.bet_levels)
 
@@ -292,6 +299,7 @@ def main() -> None:
             bet_levels,
             args.bankroll_start,
             args.bankroll_stop_on_zero,
+            args.terminate_on_bankroll_bust,
             args.betting_reward_mode,
             args.bet_entropy_bonus,
         )
@@ -385,6 +393,7 @@ def main() -> None:
             bet_levels=bet_levels,
             bankroll_start=args.bankroll_start,
             bankroll_stop_on_zero=args.bankroll_stop_on_zero,
+            terminate_on_bankroll_bust=args.terminate_on_bankroll_bust,
             betting_reward_mode=args.betting_reward_mode,
             bet_entropy_bonus=args.bet_entropy_bonus,
         )
@@ -419,6 +428,7 @@ def main() -> None:
         bet_levels=bet_levels,
         bankroll_start=args.bankroll_start,
         bankroll_stop_on_zero=args.bankroll_stop_on_zero,
+        terminate_on_bankroll_bust=args.terminate_on_bankroll_bust,
         betting_reward_mode=args.betting_reward_mode,
         bet_entropy_bonus=args.bet_entropy_bonus,
     )

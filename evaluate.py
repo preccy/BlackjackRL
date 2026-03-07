@@ -330,8 +330,10 @@ def main() -> None:
     if args.enable_betting:
         print("Bet distribution:")
         for level in bet_levels:
-            pct = 100.0 * bet_counter.get(float(level), 0) / denom_rounds
-            print(f"  {float(level):.1f}: {pct:.1f}%")
+            lvl = float(level)
+            rounds = int(bet_counter.get(lvl, 0))
+            pct = 100.0 * rounds / denom_rounds
+            print(f"  {lvl:.1f}: {pct:.1f}% ({rounds} rounds)")
         print("Bet-level diagnostics:")
         for level in bet_levels:
             lvl = float(level)

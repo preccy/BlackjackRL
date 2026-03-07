@@ -201,8 +201,9 @@ class TrainingEvalCallback(BaseCallback):
             parts = []
             for level in levels:
                 lvl = float(level)
-                pct = 100.0 * bet_counter.get(lvl, 0) / denom_rounds
+                rounds = int(bet_counter.get(lvl, 0))
+                pct = 100.0 * rounds / denom_rounds
                 lvl_roi = bet_level_profit.get(lvl, 0.0) / max(1e-9, bet_level_wagered.get(lvl, 0.0))
-                parts.append(f"{lvl:.1f}:{pct:.1f}% roi={lvl_roi:+.3f}")
+                parts.append(f"{lvl:.1f}:{pct:.1f}% ({rounds} rounds) roi={lvl_roi:+.3f}")
             print(f"Bet dist/roi: {' | '.join(parts)}")
         print("------------------------------------------------")

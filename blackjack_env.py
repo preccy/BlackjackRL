@@ -50,7 +50,8 @@ class BlackjackEnv(gym.Env):
         bankroll_stop_on_zero: bool = False,
         terminate_on_bankroll_bust: Optional[bool] = None,
         betting_reward_mode: str = "net",
-        bet_entropy_bonus: float = 0.0,
+        bet_exploration_bonus: float = 0.0,
+        bet_exploration_mode: str = "none",
     ):
         super().__init__()
         self.n_decks = n_decks
@@ -88,7 +89,10 @@ class BlackjackEnv(gym.Env):
         if betting_reward_mode == "log_bankroll" and bankroll_start is None:
             raise ValueError("betting_reward_mode='log_bankroll' requires bankroll_start to be set")
         self.betting_reward_mode = betting_reward_mode
-        self.bet_entropy_bonus = float(bet_entropy_bonus)
+        if bet_exploration_mode not in {"none", "scaled_index"}:
+            raise ValueError("bet_exploration_mode must be one of: none, scaled_index")
+        self.bet_exploration_bonus = float(bet_exploration_bonus)
+        self.bet_exploration_mode = bet_exploration_mode
 
         self.rng = random.Random(seed)
         self.shoe = Shoe(n_decks=n_decks, penetration=penetration, rng=self.rng)
@@ -422,13 +426,12 @@ class BlackjackEnv(gym.Env):
         return self.bankroll_current <= 0
 
     def _bet_exploration_bonus(self) -> float:
-        if not self.enable_betting or self.bet_entropy_bonus == 0.0:
+        if not self.enable_betting or self.bet_exploration_bonus == 0.0:
             return 0.0
-        if len(self.bet_levels) <= 1:
-            normalized_idx = 0.0
-        else:
-            normalized_idx = float(self.current_bet_index) / float(len(self.bet_levels) - 1)
-        return self.bet_entropy_bonus * normalized_idx
+        if self.bet_exploration_mode != "scaled_index":
+            return 0.0
+        normalized_idx = float(self.current_bet_index) / float(max(len(self.bet_levels) - 1, 1))
+        return self.bet_exploration_bonus * normalized_idx
 
     def _build_round_end_payload(self, round_reward: float, reshuffle_happened: bool) -> Dict[str, Any]:
         last_info = copy.deepcopy(self.last_info)
@@ -524,6 +527,7 @@ class BlackjackEnv(gym.Env):
         bet_bonus = self._bet_exploration_bonus()
         payload["round_reward_signal"] = round_reward_signal
         payload["bet_exploration_bonus"] = bet_bonus
+        payload["bet_exploration_mode"] = self.bet_exploration_mode
         payload["betting_reward_mode"] = self.betting_reward_mode
         payload["round_reward"] = round_reward_signal + bet_bonus
         if self.bankroll_start is not None:

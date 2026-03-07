@@ -171,18 +171,26 @@ def main() -> None:
     interesting = []
     total_wagered = 0.0
     bet_counter: Counter[float] = Counter()
+    bet_level_profit: Counter[float] = Counter()
+    bet_level_wagered: Counter[float] = Counter()
+    bet_level_rounds: Counter[float] = Counter()
 
     def process_round_info(round_info: dict) -> bool:
-        nonlocal resolved_rounds, resolved_hands_total, wins, pushes, losses, blackjacks, interesting, total_wagered, bet_counter
+        nonlocal resolved_rounds, resolved_hands_total, wins, pushes, losses, blackjacks, interesting, total_wagered, bet_counter, bet_level_profit, bet_level_wagered, bet_level_rounds
         outcomes = round_info.get("outcomes")
         round_finished = round_info.get("round_end", bool(outcomes))
         if not round_finished:
             return False
         outcomes = outcomes or getattr(env, "last_info", {}).get("outcomes", [])
-        total_wagered += float(round_info.get("total_wagered", sum(out.get("bet", 0.0) for out in outcomes)))
+        round_wagered = float(round_info.get("total_wagered_this_round", round_info.get("total_wagered", sum(out.get("bet", 0.0) for out in outcomes))))
+        total_wagered += round_wagered
         if args.enable_betting:
             try:
-                bet_counter[float(round_info.get("current_bet", env.current_bet))] += 1
+                bet_level = float(round_info.get("current_bet", env.current_bet))
+                bet_counter[bet_level] += 1
+                bet_level_rounds[bet_level] += 1
+                bet_level_profit[bet_level] += float(round_info.get("total_reward", sum(out.get("reward", 0.0) for out in outcomes)))
+                bet_level_wagered[bet_level] += round_wagered
             except (TypeError, ValueError):
                 pass
         resolved_rounds += 1
@@ -302,6 +310,15 @@ def main() -> None:
         for level in bet_levels:
             pct = 100.0 * bet_counter.get(float(level), 0) / denom_rounds
             print(f"  {float(level):.1f}: {pct:.1f}%")
+        print("Bet-level diagnostics:")
+        for level in bet_levels:
+            lvl = float(level)
+            rounds = int(bet_level_rounds.get(lvl, 0))
+            avg_profit = bet_level_profit.get(lvl, 0.0) / max(1, rounds)
+            lvl_roi = bet_level_profit.get(lvl, 0.0) / max(1e-9, bet_level_wagered.get(lvl, 0.0))
+            print(
+                f"  {lvl:.1f}: rounds={rounds}, avg_profit={avg_profit:+.5f}, roi={lvl_roi:+.5f}"
+            )
 
     if interesting:
         Path(args.replay_out).parent.mkdir(parents=True, exist_ok=True)

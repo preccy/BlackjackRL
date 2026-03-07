@@ -60,7 +60,7 @@ def mask_fn(env):
     )
 
 
-def make_env(rank: int, base_seed: int, obs_version: int, episode_mode: str, max_rounds_per_episode: int, enable_betting: bool, bet_levels: list[float], bankroll_start: float | None, bankroll_stop_on_zero: bool):
+def make_env(rank: int, base_seed: int, obs_version: int, episode_mode: str, max_rounds_per_episode: int, enable_betting: bool, bet_levels: list[float], bankroll_start: float | None, bankroll_stop_on_zero: bool, betting_reward_mode: str, bet_entropy_bonus: float):
     def _init():
         env = BlackjackEnv(
             seed=base_seed + rank,
@@ -71,6 +71,8 @@ def make_env(rank: int, base_seed: int, obs_version: int, episode_mode: str, max
             bet_levels=bet_levels,
             bankroll_start=bankroll_start,
             bankroll_stop_on_zero=bankroll_stop_on_zero,
+            betting_reward_mode=betting_reward_mode,
+            bet_entropy_bonus=bet_entropy_bonus,
         )
         if ActionMasker is not None:
             env = ActionMasker(env, mask_fn)
@@ -148,7 +150,7 @@ def resolve_device(requested: str) -> str:
     return requested
 
 
-def _save_meta(model_out: str, obs_version: int, episode_mode: str, max_rounds_per_episode: int, enable_betting: bool, bet_levels: list[float], bankroll_start: float | None, bankroll_stop_on_zero: bool) -> None:
+def _save_meta(model_out: str, obs_version: int, episode_mode: str, max_rounds_per_episode: int, enable_betting: bool, bet_levels: list[float], bankroll_start: float | None, bankroll_stop_on_zero: bool, betting_reward_mode: str, bet_entropy_bonus: float) -> None:
     model_path = Path(model_out)
     meta_path = model_path.with_suffix(model_path.suffix + ".meta.json") if model_path.suffix else Path(f"{model_out}.meta.json")
     meta = {
@@ -167,6 +169,8 @@ def _save_meta(model_out: str, obs_version: int, episode_mode: str, max_rounds_p
             "bet_levels": bet_levels,
             "bankroll_start": bankroll_start,
             "bankroll_stop_on_zero": bankroll_stop_on_zero,
+            "betting_reward_mode": betting_reward_mode,
+            "bet_entropy_bonus": bet_entropy_bonus,
         }
     }
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
@@ -197,6 +201,8 @@ def main() -> None:
     parser.add_argument("--bet-levels", type=str, default="1")
     parser.add_argument("--bankroll-start", type=float, default=None)
     parser.add_argument("--bankroll-stop-on-zero", action="store_true")
+    parser.add_argument("--betting-reward-mode", choices=["net", "roi", "log_bankroll"], default="net")
+    parser.add_argument("--bet-entropy-bonus", type=float, default=0.0)
     parser.add_argument("--pretrain-basic-strategy", action="store_true")
     parser.add_argument("--pretrain-epochs", type=int, default=5)
     parser.add_argument("--pretrain-samples", type=int, default=200_000)
@@ -286,6 +292,8 @@ def main() -> None:
             bet_levels,
             args.bankroll_start,
             args.bankroll_stop_on_zero,
+            args.betting_reward_mode,
+            args.bet_entropy_bonus,
         )
         for rank in range(args.n_envs)
     ]
@@ -303,6 +311,7 @@ def main() -> None:
     print(f"Observation version: {args.obs_version}")
     print(f"Episode mode: {args.episode_mode} (max_rounds_per_episode={args.max_rounds_per_episode})")
     print(f"Betting enabled: {args.enable_betting} (bet_levels={bet_levels})")
+    print(f"Bet reward mode: {args.betting_reward_mode} (entropy bonus={args.bet_entropy_bonus})")
     print(f"Vector env setup: base_seed={args.seed}, n_envs={args.n_envs}, vec_env={actual_vec_env}")
     print(f"torch num threads: {torch.get_num_threads()}")
     print(f"torch interop threads: {torch.get_num_interop_threads()}")
@@ -345,6 +354,8 @@ def main() -> None:
             episode_mode="hand",
             enable_betting=args.enable_betting,
             bet_levels=bet_levels,
+            betting_reward_mode=args.betting_reward_mode,
+            bet_entropy_bonus=args.bet_entropy_bonus,
         )
         stats = run_basic_strategy_pretrain(
             model,
@@ -374,6 +385,8 @@ def main() -> None:
             bet_levels=bet_levels,
             bankroll_start=args.bankroll_start,
             bankroll_stop_on_zero=args.bankroll_stop_on_zero,
+            betting_reward_mode=args.betting_reward_mode,
+            bet_entropy_bonus=args.bet_entropy_bonus,
         )
 
     callback = TrainingEvalCallback(
@@ -406,6 +419,8 @@ def main() -> None:
         bet_levels=bet_levels,
         bankroll_start=args.bankroll_start,
         bankroll_stop_on_zero=args.bankroll_stop_on_zero,
+        betting_reward_mode=args.betting_reward_mode,
+        bet_entropy_bonus=args.bet_entropy_bonus,
     )
     print(f"Saved model to {args.model_out}.zip")
     print(f"Total timesteps seen: {model.num_timesteps}")

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import copy
+import math
 from typing import Any, Dict, List, Optional
 import random
 
@@ -47,6 +48,8 @@ class BlackjackEnv(gym.Env):
         bet_levels: Optional[List[float]] = None,
         bankroll_start: Optional[float] = None,
         bankroll_stop_on_zero: bool = False,
+        betting_reward_mode: str = "net",
+        bet_entropy_bonus: float = 0.0,
     ):
         super().__init__()
         self.n_decks = n_decks
@@ -75,6 +78,12 @@ class BlackjackEnv(gym.Env):
         self.bankroll_start = bankroll_start
         self.bankroll_current = float(bankroll_start) if bankroll_start is not None else 0.0
         self.bankroll_stop_on_zero = bool(bankroll_stop_on_zero)
+        if betting_reward_mode not in {"net", "roi", "log_bankroll"}:
+            raise ValueError("betting_reward_mode must be one of: net, roi, log_bankroll")
+        if self.enable_betting and betting_reward_mode == "log_bankroll" and bankroll_start is None:
+            raise ValueError("betting_reward_mode='log_bankroll' requires bankroll_start to be set")
+        self.betting_reward_mode = betting_reward_mode
+        self.bet_entropy_bonus = float(bet_entropy_bonus)
 
         self.rng = random.Random(seed)
         self.shoe = Shoe(n_decks=n_decks, penetration=penetration, rng=self.rng)
@@ -103,6 +112,9 @@ class BlackjackEnv(gym.Env):
         self.last_shuffle_count = self.shoe.shuffle_count
         self.rounds_since_shuffle = 0
         self.cum_revealed_bins = np.zeros(10, dtype=np.float32)
+        self.current_bet_index = 0
+        self._bankroll_before_round: Optional[float] = None
+        self._bankroll_after_round: Optional[float] = None
 
     def _reset_cum_bins_on_shuffle(self) -> None:
         self.cum_revealed_bins = np.zeros(10, dtype=np.float32)
@@ -375,6 +387,34 @@ class BlackjackEnv(gym.Env):
         }
         return total_reward
 
+    def _round_reward_from_mode(
+        self,
+        round_profit: float,
+        total_wagered_this_round: float,
+        bankroll_before_round: Optional[float],
+        bankroll_after_round: Optional[float],
+    ) -> float:
+        if not self.enable_betting:
+            return round_profit
+        if self.betting_reward_mode == "net":
+            return round_profit
+        if self.betting_reward_mode == "roi":
+            return round_profit / max(1e-8, total_wagered_this_round)
+
+        if bankroll_before_round is None or bankroll_after_round is None:
+            return round_profit
+        eps = 1e-8
+        return math.log(bankroll_after_round + eps) - math.log(bankroll_before_round + eps)
+
+    def _bet_exploration_bonus(self) -> float:
+        if not self.enable_betting or self.bet_entropy_bonus == 0.0:
+            return 0.0
+        if len(self.bet_levels) <= 1:
+            normalized_idx = 0.0
+        else:
+            normalized_idx = float(self.current_bet_index) / float(len(self.bet_levels) - 1)
+        return self.bet_entropy_bonus * normalized_idx
+
     def _build_round_end_payload(self, round_reward: float, reshuffle_happened: bool) -> Dict[str, Any]:
         last_info = copy.deepcopy(self.last_info)
         return {
@@ -388,7 +428,11 @@ class BlackjackEnv(gym.Env):
             "round_end": True,
             "round_reward": round_reward,
             "total_wagered": last_info.get("total_wagered", 0.0),
+            "total_wagered_this_round": last_info.get("total_wagered", 0.0),
             "current_bet": last_info.get("current_bet", float(self.current_bet)),
+            "current_bet_index": int(self.current_bet_index),
+            "bankroll_before_round": self._bankroll_before_round,
+            "bankroll_after_round": self._bankroll_after_round,
             "rounds_in_episode": self.rounds_in_episode,
             "reshuffle_happened": reshuffle_happened,
             "round_replay": {
@@ -418,6 +462,7 @@ class BlackjackEnv(gym.Env):
         self.last_round_revealed_cards = []
         self.events = []
         self.current_bet = self.bet_levels[0]
+        self.current_bet_index = 0
         self.phase = "BET" if self.enable_betting else "PLAY"
         if self.bankroll_start is not None:
             self.bankroll_current = float(self.bankroll_start)
@@ -443,10 +488,29 @@ class BlackjackEnv(gym.Env):
         self.last_round_revealed_cards = self._collect_revealed_cards()
         self._update_cum_bins(self.last_round_revealed_cards)
         self.rounds_since_shuffle += 1
+        total_wagered_this_round = float(sum(hand.bet for hand in self.hands))
+        bankroll_before_round = self._bankroll_before_round
+        bankroll_after_round = self.bankroll_current if self.bankroll_start is not None else None
         if self.bankroll_start is not None:
             self.bankroll_current += round_reward
+            bankroll_after_round = self.bankroll_current
+        self._bankroll_after_round = bankroll_after_round
         payload = self._build_round_end_payload(round_reward, reshuffle_happened)
-        payload["total_wagered"] = float(sum(hand.bet for hand in self.hands))
+        payload["total_wagered"] = total_wagered_this_round
+        payload["total_wagered_this_round"] = total_wagered_this_round
+        payload["bankroll_before_round"] = bankroll_before_round
+        payload["bankroll_after_round"] = bankroll_after_round
+        round_reward_signal = self._round_reward_from_mode(
+            round_profit=round_reward,
+            total_wagered_this_round=total_wagered_this_round,
+            bankroll_before_round=bankroll_before_round,
+            bankroll_after_round=bankroll_after_round,
+        )
+        bet_bonus = self._bet_exploration_bonus()
+        payload["round_reward_signal"] = round_reward_signal
+        payload["bet_exploration_bonus"] = bet_bonus
+        payload["betting_reward_mode"] = self.betting_reward_mode
+        payload["round_reward"] = round_reward_signal + bet_bonus
         if self.bankroll_start is not None:
             payload["bankroll_current"] = float(self.bankroll_current)
         return payload
@@ -552,6 +616,9 @@ class BlackjackEnv(gym.Env):
         if self.enable_betting and self.phase == "BET":
             bet_idx = max(0, action - 4)
             self.current_bet = self.bet_levels[bet_idx]
+            self.current_bet_index = bet_idx
+            self._bankroll_before_round = self.bankroll_current if self.bankroll_start is not None else None
+            self._bankroll_after_round = self._bankroll_before_round
             self.phase = "PLAY"
             self._deal_initial()
             self._log(
@@ -567,9 +634,9 @@ class BlackjackEnv(gym.Env):
                 self.hands[0].done = True
                 self.current_hand_idx = 1
                 round_reward = self._resolve_round()
-                reward += round_reward
                 round_reshuffle = self._reshuffle_happened_this_round
                 round_payload = self._finalize_round(round_reward, round_reshuffle)
+                reward += float(round_payload["round_reward"])
                 max_rounds_hit = self.episode_mode == "shoe" and self.rounds_in_episode >= self.max_rounds_per_episode
                 bankroll_bust = self.bankroll_start is not None and self.bankroll_stop_on_zero and self.bankroll_current <= 0
 
@@ -614,6 +681,10 @@ class BlackjackEnv(gym.Env):
             }
             return self._obs(), reward, False, False, info
 
+        if self._bankroll_before_round is None and self.bankroll_start is not None:
+            self._bankroll_before_round = self.bankroll_current
+            self._bankroll_after_round = self.bankroll_current
+
         hand = self.hands[self.current_hand_idx]
         hand.actions.append(ACTION_NAMES[action])
         self._log("action", hand_index=self.current_hand_idx, action_name=ACTION_NAMES[action])
@@ -648,9 +719,9 @@ class BlackjackEnv(gym.Env):
         self._advance_hand()
         if self.current_hand_idx >= len(self.hands):
             round_reward = self._resolve_round()
-            reward += round_reward
             reshuffle_happened = self._reshuffle_happened_this_round
             round_payload = self._finalize_round(round_reward, reshuffle_happened)
+            reward += float(round_payload["round_reward"])
             max_rounds_hit = self.episode_mode == "shoe" and self.rounds_in_episode >= self.max_rounds_per_episode
             bankroll_bust = self.bankroll_start is not None and self.bankroll_stop_on_zero and self.bankroll_current <= 0
 

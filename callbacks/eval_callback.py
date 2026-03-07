@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Callable
+from collections import Counter
 
 from stable_baselines3.common.callbacks import BaseCallback
 
@@ -85,15 +86,27 @@ class TrainingEvalCallback(BaseCallback):
         resolved_hands_total = 0
         total_reward = 0.0
         total_wagered = 0.0
+        bet_counter: Counter[float] = Counter()
+        bet_level_profit: Counter[float] = Counter()
+        bet_level_wagered: Counter[float] = Counter()
 
         def process_round_info(round_info):
-            nonlocal resolved_rounds, resolved_hands_total, wins, pushes, losses, total_wagered
+            nonlocal resolved_rounds, resolved_hands_total, wins, pushes, losses, total_wagered, bet_counter, bet_level_profit, bet_level_wagered
             outcomes = round_info.get("outcomes") or getattr(eval_env, "last_info", {}).get("outcomes", [])
-            total_wagered += float(round_info.get("total_wagered", sum(outcome.get("bet", 0.0) for outcome in outcomes)))
+            round_wagered = float(round_info.get("total_wagered_this_round", round_info.get("total_wagered", sum(outcome.get("bet", 0.0) for outcome in outcomes))))
+            total_wagered += round_wagered
             if not round_info.get("round_end", bool(outcomes)):
                 return
             resolved_rounds += 1
             resolved_hands_total += len(outcomes)
+            if getattr(eval_env, "enable_betting", False):
+                try:
+                    bet_level = float(round_info.get("current_bet", eval_env.current_bet))
+                    bet_counter[bet_level] += 1
+                    bet_level_profit[bet_level] += float(round_info.get("total_reward", sum(outcome.get("reward", 0.0) for outcome in outcomes)))
+                    bet_level_wagered[bet_level] += round_wagered
+                except (TypeError, ValueError):
+                    pass
             for outcome in outcomes:
                 r = outcome.get("reward", 0)
                 if r > 0:
@@ -183,4 +196,13 @@ class TrainingEvalCallback(BaseCallback):
         print(f"ROI per unit wagered: {roi:+.3f}")
         print(f"Win rate: {win_rate * 100:.1f}%")
         print(f"Net units: {total_reward:+.0f}")
+        if getattr(eval_env, "enable_betting", False):
+            levels = getattr(eval_env, "bet_levels", [1.0])
+            parts = []
+            for level in levels:
+                lvl = float(level)
+                pct = 100.0 * bet_counter.get(lvl, 0) / denom_rounds
+                lvl_roi = bet_level_profit.get(lvl, 0.0) / max(1e-9, bet_level_wagered.get(lvl, 0.0))
+                parts.append(f"{lvl:.1f}:{pct:.1f}% roi={lvl_roi:+.3f}")
+            print(f"Bet dist/roi: {' | '.join(parts)}")
         print("------------------------------------------------")

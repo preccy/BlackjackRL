@@ -34,12 +34,28 @@ def test_bankroll_bust_defaults_to_enabled_when_bankroll_tracking_on():
     assert env.terminate_on_bankroll_bust is True
 
 
-def test_bet_entropy_bonus_scaled_by_bet_index():
-    env = BlackjackEnv(enable_betting=True, bet_levels=[1, 2, 4, 8], bet_entropy_bonus=0.2)
+def test_bet_exploration_bonus_scaled_by_bet_index():
+    env = BlackjackEnv(
+        enable_betting=True,
+        bet_levels=[1, 2, 4, 8],
+        bet_exploration_bonus=0.2,
+        bet_exploration_mode="scaled_index",
+    )
     env.current_bet_index = 0
     assert env._bet_exploration_bonus() == 0.0
     env.current_bet_index = 3
     assert env._bet_exploration_bonus() == 0.2
+
+
+def test_bet_exploration_bonus_mode_none_is_disabled():
+    env = BlackjackEnv(
+        enable_betting=True,
+        bet_levels=[1, 2, 4, 8],
+        bet_exploration_bonus=0.2,
+        bet_exploration_mode="none",
+    )
+    env.current_bet_index = 3
+    assert env._bet_exploration_bonus() == 0.0
 
 
 def test_round_payload_exposes_wager_and_bankroll_fields():
@@ -63,3 +79,11 @@ def test_round_payload_exposes_wager_and_bankroll_fields():
 def test_non_betting_mode_uses_net_reward_behavior():
     env = BlackjackEnv(enable_betting=False)
     assert env._round_reward_from_mode(3.0, 10.0, None, None) == 3.0
+
+
+def test_invalid_bet_exploration_mode_rejected():
+    try:
+        BlackjackEnv(enable_betting=True, bet_levels=[1, 2], bet_exploration_mode="bad_mode")
+        assert False, "Expected ValueError for invalid bet_exploration_mode"
+    except ValueError:
+        pass
